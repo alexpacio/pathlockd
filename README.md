@@ -128,7 +128,9 @@ release:
 - [ ] **Metrics** — no metrics/observability endpoint yet (e.g. Prometheus:
   retry/conflict rates, lock counts, transaction latency, GC reclaimed).
 - [ ] **CI** — no continuous-integration pipeline yet (build, clippy, unit +
-  integration tests against an ephemeral TiKV on every push/PR).
+  integration tests against an ephemeral TiKV on every push/PR). Container
+  images are published via [`.github/workflows/docker-publish.yml`](.github/workflows/docker-publish.yml)
+  on every `v*` tag.
 - [ ] **Authentication & authorization, TLS** — the gRPC surface is currently
   unauthenticated and in plaintext; until then, run pathlockd only on a trusted
   network or behind a TLS-terminating, authenticating proxy.
@@ -146,12 +148,14 @@ the Node.js client target `linux/amd64`.
 
 ## Running from the container image
 
-Pre-built images are published to GHCR on every release:
+Pre-built images are published to GHCR on every version tag (`v*`) in two flavors:
 
-```text
-ghcr.io/alexpacio/pathlockd:0.1.3   # pinned
-ghcr.io/alexpacio/pathlockd:latest  # latest release
-```
+| Image tag | Binary | Notes |
+| --- | --- | --- |
+| `ghcr.io/alexpacio/pathlockd:0.1.3` | generic x86-64 | baseline; runs on any amd64 host |
+| `ghcr.io/alexpacio/pathlockd:0.1.3-x86-64-v4` | x86-64-v4 | AVX-512 + BMI2 + POPCNT + MOVBE; ~5-15 % faster on modern Xeons/EPYC; **illegal instruction** on older CPUs |
+
+Use the `-x86-64-v4` tag when your hosts are Haswell-class or newer (AWS `c5`/`m5`/`r5`, GCP `n2`, Azure `Dsv4`, and any server CPU from ≈2017+). Confirm with `grep avx512 /proc/cpuinfo` before deploying.
 
 **Dependency — TiKV cluster.** pathlockd stores all state in TiKV and needs
 one or more PD (Placement Driver) endpoints. For a local playground a
@@ -168,10 +172,17 @@ docker run -d --name tikv --network=container:pd pingcap/tikv:latest \
 **Run pathlockd:**
 
 ```bash
+# generic build (any amd64 host)
 docker run -d --restart=unless-stopped \
   -p 50051:50051 \
   -e PATHLOCKD_PD_ENDPOINTS="127.0.0.1:2379" \
-  ghcr.io/alexpacio/pathlockd:latest
+  ghcr.io/alexpacio/pathlockd:0.1.3
+
+# x86-64-v4 build (AVX-512 hosts — check with: grep avx512 /proc/cpuinfo)
+docker run -d --restart=unless-stopped \
+  -p 50051:50051 \
+  -e PATHLOCKD_PD_ENDPOINTS="127.0.0.1:2379" \
+  ghcr.io/alexpacio/pathlockd:0.1.3-x86-64-v4
 ```
 
 **Key env vars** (see [Configuration](#configuration) for the full list):
@@ -224,7 +235,7 @@ stateless pathlockd replicas.
    docker run -d --restart=unless-stopped -p 50051:50051 \
      -e PATHLOCKD_PD_ENDPOINTS="pd0:2379,pd1:2379,pd2:2379" \
      -e PATHLOCKD_LISTEN="0.0.0.0:50051" \
-     ghcr.io/alexpacio/pathlockd:latest        # or your built image
+     ghcr.io/alexpacio/pathlockd:0.1.3          # or :0.1.3-x86-64-v4 on AVX-512 hosts
    ```
 
 3. **Cross-instance events (optional).** A lifecycle event is raised on the
@@ -272,6 +283,23 @@ are present (`cmake`, `protobuf-compiler`, `pkg-config`, `libssl-dev`). The
 [`Dockerfile`](Dockerfile) installs them in its builder stage, so `docker build`
 needs nothing on the host.
 
+**x86-64-v4 (AVX-512) build** — pass the target CPU via `RUSTFLAGS`:
+
+```bash
+# native binary
+RUSTFLAGS="-C target-cpu=x86-64-v4" cargo build --release
+
+# container image
+docker build --build-arg RUSTFLAGS="-C target-cpu=x86-64-v4" -t pathlockd:x86-64-v4 .
+```
+
+The resulting binary will crash with `Illegal instruction` on CPUs that don't
+support x86-64-v4 (AVX-512, BMI2, POPCNT, MOVBE). Verify host support first:
+
+```bash
+grep -c avx512 /proc/cpuinfo   # > 0 means the CPU is compatible
+```
+
 ## Testing
 
 Everything runs inside containers, so Docker is the only prerequisite (no host
@@ -312,6 +340,19 @@ tags, pushes, and publishes the GitHub release in one shot.
 It refuses to run on a dirty tree, on a version/tag mismatch, or if the tag or
 release already exists. Artifacts land in `dist/<tag>/` (release + debug
 tarballs + `SHA256SUMS`).
+
+**Container images** are published automatically by the
+[Docker publish workflow](.github/workflows/docker-publish.yml) whenever a
+`v*` tag is pushed. Two images are built in parallel from the same
+[`Dockerfile`](Dockerfile):
+
+| Tag pattern | `RUSTFLAGS` |
+| --- | --- |
+| `:v1.2.3`, `:1.2` | *(none — generic x86-64)* |
+| `:v1.2.3-x86-64-v4`, `:1.2-x86-64-v4` | `-C target-cpu=x86-64-v4` |
+
+Images are pushed to `ghcr.io/alexpacio/pathlockd` using the built-in
+`GITHUB_TOKEN`; no extra secrets are required.
 
 ## License
 
