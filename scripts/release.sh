@@ -13,7 +13,9 @@
 # Preconditions (checked, fails fast before anything irreversible):
 #   - cargo, gh (authenticated), tar, sha256sum, git installed;
 #   - clean working tree, not behind the remote;
-#   - Cargo.toml's [package] version == <tag> without the leading 'v';
+#   - Cargo.toml's [package] version == <tag> without the leading 'v'
+#     (if it doesn't match and --dry-run is NOT set, Cargo.toml + Cargo.lock
+#     are bumped and committed automatically);
 #   - the tag (local + remote) and a GitHub release for it do not yet exist.
 #
 # Artifacts are built ON THIS HOST, so they are dynamically linked against the
@@ -26,7 +28,7 @@
 set -euo pipefail
 
 usage() {
-  sed -n '2,29p' "$0" | sed 's/^# \{0,1\}//'
+  sed -n '2,27p' "$0" | sed 's/^# \{0,1\}//'
 }
 
 die()  { echo "✖ $*" >&2; exit 1; }
@@ -51,7 +53,7 @@ done
 cd "$(dirname "$0")/.."
 
 # ---------------------------------------------------------------- tooling
-for t in cargo gh tar sha256sum git awk; do
+for t in cargo gh tar sha256sum git awk docker; do
   command -v "$t" >/dev/null 2>&1 || die "required tool not found: $t"
 done
 gh auth status >/dev/null 2>&1 || die "gh is not authenticated (run: gh auth login)"
@@ -62,14 +64,24 @@ case "$TAG" in
   *) die "tag must look like vMAJOR.MINOR.PATCH (e.g. v0.1.2), got: $TAG" ;;
 esac
 
+GH_USER="$(gh api user --jq .login)"
+GHCR_IMAGE="ghcr.io/$GH_USER/pathlockd"
+
 NOTES="release_notes/$TAG/gh.md"
 [ -f "$NOTES" ] || die "release notes not found: $NOTES — create it first"
 [ -s "$NOTES" ] || die "release notes are empty: $NOTES"
 
 PKG_VERSION="$(awk -F'"' '/^\[/{p=($0=="[package]")} p&&/^version[[:space:]]*=/{print $2; exit}' Cargo.toml)"
 [ -n "$PKG_VERSION" ] || die "could not read [package] version from Cargo.toml"
-[ "$PKG_VERSION" = "$VERSION" ] \
-  || die "Cargo.toml version is $PKG_VERSION but tag is $TAG — bump the version and commit first"
+if [ "$PKG_VERSION" != "$VERSION" ]; then
+  [ "$DRY_RUN" = 0 ] \
+    || die "Cargo.toml version is $PKG_VERSION but tag is $TAG — bump it and commit first (or run without --dry-run to auto-bump)"
+  note "bumping Cargo.toml $PKG_VERSION → $VERSION …"
+  sed -i "s/^version = \"$PKG_VERSION\"/version = \"$VERSION\"/" Cargo.toml
+  cargo update --package pathlockd
+  git add Cargo.toml Cargo.lock
+  git commit -m "chore: release $TAG"
+fi
 
 # ---------------------------------------------------------------- git state
 BRANCH="$(git rev-parse --abbrev-ref HEAD)"
@@ -90,30 +102,41 @@ if git rev-parse -q --verify "refs/remotes/origin/$BRANCH" >/dev/null; then
     || die "local $BRANCH is behind origin/$BRANCH — pull/rebase before releasing"
 fi
 
-# ---------------------------------------------------------------- build
-note "building release + debug binaries (linux/amd64) …"
-cargo build --release
-cargo build
-REL="target/release/pathlockd"; DBG="target/debug/pathlockd"
-[ -x "$REL" ] && [ -x "$DBG" ] || die "expected binaries missing after build"
-GOT="$("$REL" --version | awk '{print $2}')"
-[ "$GOT" = "$VERSION" ] || die "release binary reports version $GOT, expected $VERSION"
-
-# ---------------------------------------------------------------- package
+# ---------------------------------------------------------------- build + package
 DIST="dist/$TAG"
 REL_TGZ="pathlockd-$VERSION-linux-amd64.tar.gz"
 DBG_TGZ="pathlockd-$VERSION-linux-amd64-debug.tar.gz"
-rm -rf "$DIST"; mkdir -p "$DIST/.stage"
-cp "$REL" "$DIST/.stage/pathlockd"; tar -C "$DIST/.stage" -czf "$DIST/$REL_TGZ" pathlockd
-cp "$DBG" "$DIST/.stage/pathlockd"; tar -C "$DIST/.stage" -czf "$DIST/$DBG_TGZ" pathlockd
-rm -rf "$DIST/.stage"
-( cd "$DIST" && sha256sum "$REL_TGZ" "$DBG_TGZ" > SHA256SUMS )
+
+if [ -f "$DIST/$REL_TGZ" ] && [ -f "$DIST/$DBG_TGZ" ] && [ -f "$DIST/SHA256SUMS" ]; then
+  note "dist artifacts already present in $DIST — skipping build and package."
+else
+  note "building release + debug binaries (linux/amd64) …"
+  cargo build --release
+  cargo build
+  REL="target/release/pathlockd"; DBG="target/debug/pathlockd"
+  [ -x "$REL" ] && [ -x "$DBG" ] || die "expected binaries missing after build"
+  GOT="$("$REL" --version | awk '{print $2}')"
+  [ "$GOT" = "$VERSION" ] || die "release binary reports version $GOT, expected $VERSION"
+  rm -rf "$DIST"; mkdir -p "$DIST/.stage"
+  cp "$REL" "$DIST/.stage/pathlockd"; tar -C "$DIST/.stage" -czf "$DIST/$REL_TGZ" pathlockd
+  cp "$DBG" "$DIST/.stage/pathlockd"; tar -C "$DIST/.stage" -czf "$DIST/$DBG_TGZ" pathlockd
+  rm -rf "$DIST/.stage"
+  ( cd "$DIST" && sha256sum "$REL_TGZ" "$DBG_TGZ" > SHA256SUMS )
+fi
 note "artifacts in $DIST:"
 ls -lh "$DIST"/*.tar.gz "$DIST"/SHA256SUMS | awk '{print "   " $9 "  (" $5 ")"}'
 
+# ---------------------------------------------------------------- docker build
+if docker image inspect "$GHCR_IMAGE:$VERSION" >/dev/null 2>&1; then
+  note "container image $GHCR_IMAGE:$VERSION already present locally — skipping build."
+else
+  note "building container image ($GHCR_IMAGE:$VERSION) …"
+  docker build -t "$GHCR_IMAGE:$VERSION" -t "$GHCR_IMAGE:latest" .
+fi
+
 # ---------------------------------------------------------------- dry-run stop
 if [ "$DRY_RUN" = 1 ]; then
-  note "dry-run complete — would tag $TAG on $BRANCH ($(git rev-parse --short HEAD)), push, and create the GitHub release with the assets above."
+  note "dry-run complete — would tag $TAG on $BRANCH ($(git rev-parse --short HEAD)), push, create the GitHub release with the assets above, and push $GHCR_IMAGE:$VERSION to GHCR."
   exit 0
 fi
 
@@ -131,5 +154,12 @@ note "creating GitHub release $TAG …"
 gh release create "$TAG" "${GH_FLAGS[@]}" \
   "$DIST/$REL_TGZ" "$DIST/$DBG_TGZ" "$DIST/SHA256SUMS"
 
+note "logging in to ghcr.io as $GH_USER …"
+gh auth token | docker login ghcr.io -u "$GH_USER" --password-stdin
+note "pushing $GHCR_IMAGE:$VERSION and :latest …"
+docker push "$GHCR_IMAGE:$VERSION"
+docker push "$GHCR_IMAGE:latest"
+
 note "done:"
 gh release view "$TAG" --json url,assets --jq '.url, (.assets[] | "  asset: " + .name)'
+echo "  image: $GHCR_IMAGE:$VERSION"
