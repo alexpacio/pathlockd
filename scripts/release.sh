@@ -3,7 +3,7 @@
 # release from a notes file.
 #
 # Usage:
-#   scripts/release.sh [--dry-run] [--prerelease] [--draft] [--build] [--docker] <tag>
+#   scripts/release.sh [--dry-run] [--prerelease] [--draft] [--build] [--docker] [--docker-v4] <tag>
 #
 # <tag> is the git tag to create, e.g. v0.2.1. Release notes are read from
 #   release_notes/<tag>/gh.md     (required; author it before releasing)
@@ -25,6 +25,9 @@
 #
 # Docker images are published automatically by the GitHub Actions workflow on
 # every v* tag push; use --docker only for local / manual image builds.
+# Add --docker-v4 to also build and push the AVX-512-optimized :VERSION-x86-64-v4 variant
+# (linux/amd64 only); this is intentionally not built by CI.
+# Set GHCR_TOKEN to a PAT with write:packages to avoid interactive gh auth prompts.
 #
 # Artifacts (when --build):
 #   dist/<tag>/pathlockd-<version>-linux-amd64.tar.gz        (release, stripped)
@@ -41,7 +44,7 @@ note() { echo "▶ $*"; }
 warn() { echo "⚠ $*" >&2; }
 
 # ---------------------------------------------------------------- args
-DRY_RUN=0; PRERELEASE=0; DRAFT=0; BUILD=0; DOCKER=0; TAG=""
+DRY_RUN=0; PRERELEASE=0; DRAFT=0; BUILD=0; DOCKER=0; DOCKER_V4=0; TAG=""
 while [ $# -gt 0 ]; do
   case "$1" in
     --dry-run)    DRY_RUN=1 ;;
@@ -49,6 +52,7 @@ while [ $# -gt 0 ]; do
     --draft)      DRAFT=1 ;;
     --build)      BUILD=1 ;;
     --docker)     DOCKER=1 ;;
+    --docker-v4)  DOCKER=1; DOCKER_V4=1 ;;
     -h|--help)    usage; exit 0 ;;
     -*)           die "unknown flag: $1 (try --help)" ;;
     *)            [ -z "$TAG" ] || die "unexpected extra argument: $1"; TAG="$1" ;;
@@ -99,7 +103,6 @@ fi
 # ---------------------------------------------------------------- git state
 BRANCH="$(git rev-parse --abbrev-ref HEAD)"
 [ "$BRANCH" = "main" ] || warn "releasing from branch '$BRANCH' (not main)"
-[ -z "$(git status --porcelain)" ] || die "working tree is dirty — commit or stash before releasing"
 
 LOCAL_TAG_EXISTS=0; REMOTE_TAG_EXISTS=0; RELEASE_EXISTS=0
 
@@ -110,6 +113,11 @@ git ls-remote --exit-code --tags origin "refs/tags/$TAG" >/dev/null 2>&1 \
   && REMOTE_TAG_EXISTS=1 && warn "remote tag $TAG already exists — will skip tag push"
 gh release view "$TAG" >/dev/null 2>&1 \
   && RELEASE_EXISTS=1 && warn "GitHub release $TAG already exists — will skip release creation"
+
+# A clean tree is only required when we are about to create a new tag.
+[ "$LOCAL_TAG_EXISTS" = 1 ] \
+  || [ -z "$(git status --porcelain)" ] \
+  || die "working tree is dirty — commit or stash before releasing"
 
 if git rev-parse -q --verify "refs/remotes/origin/$BRANCH" >/dev/null; then
   git merge-base --is-ancestor "origin/$BRANCH" HEAD \
@@ -161,8 +169,9 @@ if [ "$DRY_RUN" = 1 ]; then
   note "dry-run complete — would tag $TAG on $BRANCH ($(git rev-parse --short HEAD)), push, and create the GitHub release."
   [ "$BUILD" = 1 ]  && note "  --build:  would attach artifacts from $DIST to the release."
   [ "$BUILD" = 0 ]  && note "  no --build: release will be created without binary artifacts."
-  [ "$DOCKER" = 1 ] && note "  --docker: would also push $GHCR_IMAGE:$VERSION (linux/amd64+arm64) and :$VERSION-x86-64-v4 (linux/amd64) to GHCR."
-  note "  The GitHub Actions workflow will publish both container images automatically on tag push."
+  [ "$DOCKER" = 1 ]    && note "  --docker:    would push $GHCR_IMAGE:$VERSION (linux/amd64+arm64) to GHCR."
+  [ "$DOCKER_V4" = 1 ] && note "  --docker-v4: would also push $GHCR_IMAGE:$VERSION-x86-64-v4 (linux/amd64) to GHCR."
+  note "  The GitHub Actions workflow will publish the default container image automatically on tag push."
   exit 0
 fi
 
@@ -200,9 +209,11 @@ else
 fi
 
 if [ "$DOCKER" = 1 ]; then
+  # Use GHCR_TOKEN env var (PAT with write:packages) if set; otherwise fall back
+  # to the existing gh session token (requires write:packages scope already granted).
+  GHCR_LOGIN_TOKEN="${GHCR_TOKEN:-$(gh auth token)}"
   note "logging in to ghcr.io as $GH_USER …"
-  gh auth refresh -s write:packages
-  gh auth token | docker login ghcr.io -u "$GH_USER" --password-stdin
+  printf '%s' "$GHCR_LOGIN_TOKEN" | docker login ghcr.io -u "$GH_USER" --password-stdin
 
   if docker buildx imagetools inspect "$GHCR_IMAGE:$VERSION" >/dev/null 2>&1; then
     note "$GHCR_IMAGE:$VERSION already exists — skipping multi-platform push."
@@ -215,16 +226,18 @@ if [ "$DOCKER" = 1 ]; then
       .
   fi
 
-  if docker buildx imagetools inspect "$GHCR_IMAGE:$VERSION-x86-64-v4" >/dev/null 2>&1; then
-    note "$GHCR_IMAGE:$VERSION-x86-64-v4 already exists — skipping x86-64-v4 push."
-  else
-    note "pushing $GHCR_IMAGE:$VERSION-x86-64-v4 (linux/amd64) …"
-    docker buildx build \
-      --platform linux/amd64 \
-      --build-arg RUSTFLAGS="-C target-cpu=x86-64-v4" \
-      -t "$GHCR_IMAGE:$VERSION-x86-64-v4" \
-      --push \
-      .
+  if [ "$DOCKER_V4" = 1 ]; then
+    if docker buildx imagetools inspect "$GHCR_IMAGE:$VERSION-x86-64-v4" >/dev/null 2>&1; then
+      note "$GHCR_IMAGE:$VERSION-x86-64-v4 already exists — skipping x86-64-v4 push."
+    else
+      note "pushing $GHCR_IMAGE:$VERSION-x86-64-v4 (linux/amd64, AVX-512) …"
+      docker buildx build \
+        --platform linux/amd64 \
+        --build-arg RUSTFLAGS="-C target-cpu=x86-64-v4" \
+        -t "$GHCR_IMAGE:$VERSION-x86-64-v4" \
+        --push \
+        .
+    fi
   fi
 fi
 

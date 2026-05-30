@@ -15,20 +15,6 @@ jobs:
       contents: read
       packages: write
 
-    strategy:
-      matrix:
-        include:
-          # Generic build: amd64 + arm64 (macOS Apple Silicon compatible)
-          - flavor: default
-            rustflags: ""
-            suffix: ""
-            platforms: linux/amd64,linux/arm64
-          # x86-64-v4 (AVX-512): amd64 only — this ISA does not exist on ARM
-          - flavor: x86-64-v4
-            rustflags: "-C target-cpu=x86-64-v4"
-            suffix: "-x86-64-v4"
-            platforms: linux/amd64
-
     steps:
       - uses: actions/checkout@v4
 
@@ -51,18 +37,14 @@ jobs:
         with:
           images: ${{ env.IMAGE }}
           tags: |
-            # :v1.2.3 / :v1.2.3-x86-64-v4
-            type=semver,pattern={{version}},suffix=${{ matrix.suffix }}
-            # :1.2 / :1.2-x86-64-v4
-            type=semver,pattern={{major}}.{{minor}},suffix=${{ matrix.suffix }}
+            type=semver,pattern={{version}}
+            type=semver,pattern={{major}}.{{minor}}
 
       - name: Build and push
         uses: docker/build-push-action@v6
         with:
           context: .
           push: true
-          platforms: ${{ matrix.platforms }}
+          platforms: linux/amd64,linux/arm64
           tags: ${{ steps.meta.outputs.tags }}
           labels: ${{ steps.meta.outputs.labels }}
-          build-args: |
-            RUSTFLAGS=${{ matrix.rustflags }}

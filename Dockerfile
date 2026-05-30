@@ -1,11 +1,11 @@
 # ---- builder ----
-FROM rust:1-bookworm AS builder
+FROM rust:1-alpine AS builder
 
 # grpcio (pulled in by tikv-client) builds the gRPC C-core via cmake; bindgen is
 # not required (checked-in bindings) but cmake/clang/pkg-config/openssl are.
-RUN apt-get update && apt-get install -y --no-install-recommends \
-        protobuf-compiler cmake clang pkg-config libssl-dev \
-    && rm -rf /var/lib/apt/lists/*
+# OPENSSL_STATIC=1 ensures a fully static binary compatible with distroless/static.
+RUN apk add --no-cache \
+        protobuf-dev cmake clang pkgconfig openssl-dev musl-dev
 
 WORKDIR /build
 COPY Cargo.toml Cargo.lock ./
@@ -16,23 +16,19 @@ COPY src ./src
 # Pass e.g. RUSTFLAGS="-C target-cpu=x86-64-v4" for microarch-tuned builds.
 ARG RUSTFLAGS=""
 ENV RUSTFLAGS=${RUSTFLAGS}
+ENV OPENSSL_STATIC=1
 RUN cargo build --release --locked
 
 # ---- runtime ----
-FROM debian:bookworm-slim AS runtime
-
-RUN apt-get update && apt-get install -y --no-install-recommends \
-        ca-certificates libssl3 \
-    && rm -rf /var/lib/apt/lists/* \
-    && useradd --system --uid 10001 --no-create-home --shell /usr/sbin/nologin pathlockd
+FROM gcr.io/distroless/static-debian13 AS runtime
 
 COPY --from=builder /build/target/release/pathlockd /usr/local/bin/pathlockd
 
 EXPOSE 50051
 ENV PATHLOCKD_LISTEN=0.0.0.0:50051
 
-# Drop privileges: the daemon needs no root capabilities.
-USER pathlockd
+# distroless/static ships a built-in nonroot user (uid 65532).
+USER nonroot
 
 # Liveness/readiness via the daemon's own Health RPC (also verifies TiKV
 # reachability). Uses the binary itself, so no extra tooling in the image.
