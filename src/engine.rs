@@ -11,8 +11,8 @@ use tikv_client::TransactionClient;
 use tracing::warn;
 
 use crate::store::{
-    alive_key, fence_key, handler_of, own_key, rd_key, rddesc_key, wait_key, wr_key, wrdesc_key, Tx,
-    FENCE_MIN_TTL_MS, FENCING_COUNTER_KEY,
+    alive_key, fence_key, handler_of, own_key, rd_key, rddesc_key, wait_key, wr_key, wrdesc_key,
+    Tx, FENCE_MIN_TTL_MS, FENCING_COUNTER_KEY,
 };
 
 /// Above this many descendant-index members a single scan starts to
@@ -344,7 +344,8 @@ async fn acquire_inner(tx: &mut Tx, args: &AcquireArgs) -> anyhow::Result<Acquir
                         }
                     }
                     // C. descendant write/read subtree must be clear.
-                    if let Some((p, o, r)) = find_descendant_write_conflict(tx, owner, path).await? {
+                    if let Some((p, o, r)) = find_descendant_write_conflict(tx, owner, path).await?
+                    {
                         return Ok(AcquireOutcome::Conflict {
                             path: p,
                             owner: o,
@@ -521,11 +522,7 @@ pub async fn release_all(
     txn_retry!(client, tx => { release_all_inner(&mut tx, owner, del_wait_key).await })
 }
 
-async fn release_all_inner(
-    tx: &mut Tx,
-    owner: &str,
-    del_wait_key: bool,
-) -> anyhow::Result<()> {
+async fn release_all_inner(tx: &mut Tx, owner: &str, del_wait_key: bool) -> anyhow::Result<()> {
     let own_k = own_key(owner);
     let alive_k = alive_key(owner);
     let held = tx.smembers(&own_k).await?;
@@ -579,7 +576,13 @@ pub async fn renew(
     owner: &str,
     ttl_ms: u64,
 ) -> anyhow::Result<RenewOutcome> {
-    txn_retry!(client, tx => { renew_inner(&mut tx, owner, ttl_ms).await })
+    // Commit only a successful renewal. LOST can be discovered after the
+    // renewal has already refreshed earlier keys in the transaction, so rolling
+    // it back keeps the lease state from being partially extended after the
+    // caller has been told the lock is gone.
+    txn_retry!(client, commit_if: |o: &RenewOutcome| matches!(o, RenewOutcome::Ok), tx => {
+        renew_inner(&mut tx, owner, ttl_ms).await
+    })
 }
 
 async fn renew_inner(tx: &mut Tx, owner: &str, ttl_ms: u64) -> anyhow::Result<RenewOutcome> {
@@ -1002,7 +1005,10 @@ mod tests {
             get_ancestors("h:/a/b/c"),
             vec!["h:/a/b".to_string(), "h:/a".to_string(), "h:/".to_string()]
         );
-        assert_eq!(get_ancestors("h:/a/b"), vec!["h:/a".to_string(), "h:/".to_string()]);
+        assert_eq!(
+            get_ancestors("h:/a/b"),
+            vec!["h:/a".to_string(), "h:/".to_string()]
+        );
         assert_eq!(get_ancestors("h:/a"), vec!["h:/".to_string()]);
     }
 

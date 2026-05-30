@@ -11,21 +11,24 @@ use tikv_client::TransactionClient;
 use tokio_stream::wrappers::BroadcastStream;
 use tonic::{Request, Response, Status};
 
-use crate::engine::{self, AcquireArgs, AcquireOutcome, AssertOutcome, CycleOutcome, LockReq, RelReq, RenewOutcome};
+use crate::engine::{
+    self, AcquireArgs, AcquireOutcome, AssertOutcome, CycleOutcome, LockReq, RelReq, RenewOutcome,
+};
 use crate::events::Broadcaster;
 use crate::proto::{
     self, path_lock_debug_server::PathLockDebug, path_lock_server::PathLock, AcquireRequest,
     AcquireResponse, AcquireStatus, AssertFencingRequest, AssertFencingResponse, AssertStatus,
     ClearWaitEdgeRequest, ClearWaitEdgeResponse, CycleKind, DebugAck, DeleteLockKeyRequest,
-    DetectCycleRequest, DetectCycleResponse, Event, ExpireOwnerRequest, FlushRequest, FlushResponse,
-    ForceReleaseRequest, ForceReleaseResponse, GetFenceRequest, GetFenceResponse,
-    GetFencingCounterRequest, GetFencingCounterResponse, GetWriteOwnerRequest, GetWriteOwnerResponse,
-    HealthRequest, HealthResponse, IncrFencingTokenRequest, IncrFencingTokenResponse,
-    IsBlockingRequest, IsBlockingResponse, IsOwnerAliveRequest, IsOwnerAliveResponse,
-    OwnedPathsRequest, OwnedPathsResponse, PublishEventRequest, PublishEventResponse, RenewRequest,
-    RenewResponse, RenewStatus, ReleaseAllRequest, ReleaseLocksRequest, ReleaseResponse,
-    RequestRevokeRequest, RequestRevokeResponse, SetFenceRequest, SetFencingCounterRequest,
-    SetWaitEdgeRequest, SetWaitEdgeResponse, SetWriteOwnerRequest, SubscribeRequest,
+    DetectCycleRequest, DetectCycleResponse, Event, ExpireOwnerRequest, FlushRequest,
+    FlushResponse, ForceReleaseRequest, ForceReleaseResponse, GetFenceRequest, GetFenceResponse,
+    GetFencingCounterRequest, GetFencingCounterResponse, GetWriteOwnerRequest,
+    GetWriteOwnerResponse, HealthRequest, HealthResponse, IncrFencingTokenRequest,
+    IncrFencingTokenResponse, IsBlockingRequest, IsBlockingResponse, IsOwnerAliveRequest,
+    IsOwnerAliveResponse, OwnedPathsRequest, OwnedPathsResponse, PublishEventRequest,
+    PublishEventResponse, ReleaseAllRequest, ReleaseLocksRequest, ReleaseResponse, RenewRequest,
+    RenewResponse, RenewStatus, RequestRevokeRequest, RequestRevokeResponse, SetFenceRequest,
+    SetFencingCounterRequest, SetWaitEdgeRequest, SetWaitEdgeResponse, SetWriteOwnerRequest,
+    SubscribeRequest,
 };
 
 fn internal<E: std::fmt::Display>(e: E) -> Status {
@@ -58,9 +61,12 @@ const MAX_PATHS_PER_REQUEST: usize = 1024;
 /// scan; `DetectCycle.max_depth` is clamped to this rather than rejected.
 const MAX_CYCLE_DEPTH: u32 = 4096;
 
+#[allow(clippy::result_large_err)]
 fn check_id(label: &str, id: &str) -> Result<(), Status> {
     if id.is_empty() {
-        return Err(Status::invalid_argument(format!("{label} must not be empty")));
+        return Err(Status::invalid_argument(format!(
+            "{label} must not be empty"
+        )));
     }
     if id.len() > MAX_ID_LEN {
         return Err(Status::invalid_argument(format!(
@@ -70,6 +76,7 @@ fn check_id(label: &str, id: &str) -> Result<(), Status> {
     Ok(())
 }
 
+#[allow(clippy::result_large_err)]
 fn check_ttl(ttl_ms: u64) -> Result<(), Status> {
     if ttl_ms == 0 {
         return Err(Status::invalid_argument(
@@ -88,6 +95,7 @@ fn check_ttl(ttl_ms: u64) -> Result<(), Status> {
 /// would silently break containment (no handler, non-rooted path, `//`, `.`/`..`
 /// segments, trailing slash on a non-root path) so a malformed path fails fast
 /// instead of locking a node that conflicts with nothing.
+#[allow(clippy::result_large_err)]
 fn check_path(path: &str) -> Result<(), Status> {
     if path.is_empty() || path.len() > MAX_PATH_LEN {
         return Err(Status::invalid_argument("path empty or too long"));
@@ -159,7 +167,10 @@ pub struct PathLockService {
 
 impl PathLockService {
     pub fn new(client: Arc<TransactionClient>, broadcaster: Broadcaster) -> Self {
-        Self { client, broadcaster }
+        Self {
+            client,
+            broadcaster,
+        }
     }
 }
 
@@ -212,7 +223,9 @@ impl PathLock for PathLockService {
             release_requests,
         };
 
-        let outcome = engine::acquire(&self.client, args).await.map_err(engine_err)?;
+        let outcome = engine::acquire(&self.client, args)
+            .await
+            .map_err(engine_err)?;
         let resp = match outcome {
             AcquireOutcome::Ok => {
                 // RELEASED is published only when an inline release actually ran and
@@ -288,7 +301,10 @@ impl PathLock for PathLockService {
         Ok(Response::new(ReleaseResponse {}))
     }
 
-    async fn renew(&self, request: Request<RenewRequest>) -> Result<Response<RenewResponse>, Status> {
+    async fn renew(
+        &self,
+        request: Request<RenewRequest>,
+    ) -> Result<Response<RenewResponse>, Status> {
         let req = request.into_inner();
         check_id("owner_id", &req.owner_id)?;
         check_ttl(req.ttl_ms)?;
@@ -336,9 +352,10 @@ impl PathLock for PathLockService {
         for p in &req.paths {
             check_path(p)?;
         }
-        let outcome = engine::assert_fencing(&self.client, &req.owner_id, req.fencing_token, &req.paths)
-            .await
-            .map_err(engine_err)?;
+        let outcome =
+            engine::assert_fencing(&self.client, &req.owner_id, req.fencing_token, &req.paths)
+                .await
+                .map_err(engine_err)?;
         let resp = match outcome {
             AssertOutcome::Ok => AssertFencingResponse {
                 status: AssertStatus::Ok as i32,
@@ -387,9 +404,14 @@ impl PathLock for PathLockService {
         let req = request.into_inner();
         check_path(&req.conflict_path)?;
         check_id("conflict_owner", &req.conflict_owner)?;
-        let blocking = engine::is_blocking(&self.client, &req.conflict_path, &req.conflict_owner, &req.reason)
-            .await
-            .map_err(engine_err)?;
+        let blocking = engine::is_blocking(
+            &self.client,
+            &req.conflict_path,
+            &req.conflict_owner,
+            &req.reason,
+        )
+        .await
+        .map_err(engine_err)?;
         Ok(Response::new(IsBlockingResponse { blocking }))
     }
 
@@ -397,7 +419,9 @@ impl PathLock for PathLockService {
         &self,
         _request: Request<IncrFencingTokenRequest>,
     ) -> Result<Response<IncrFencingTokenResponse>, Status> {
-        let token = engine::incr_fencing_token(&self.client).await.map_err(engine_err)?;
+        let token = engine::incr_fencing_token(&self.client)
+            .await
+            .map_err(engine_err)?;
         Ok(Response::new(IncrFencingTokenResponse { token }))
     }
 
@@ -521,6 +545,7 @@ impl DebugService {
         Self { client, enabled }
     }
 
+    #[allow(clippy::result_large_err)]
     fn guard(&self) -> Result<(), Status> {
         if self.enabled {
             Ok(())
@@ -536,7 +561,9 @@ impl DebugService {
 impl PathLockDebug for DebugService {
     async fn flush(&self, _r: Request<FlushRequest>) -> Result<Response<FlushResponse>, Status> {
         self.guard()?;
-        let deleted = crate::store::flush_all(&self.client).await.map_err(internal)?;
+        let deleted = crate::store::flush_all(&self.client)
+            .await
+            .map_err(internal)?;
         Ok(Response::new(FlushResponse { deleted }))
     }
 
@@ -671,7 +698,10 @@ mod tests {
     #[test]
     fn check_id_rejects_empty_and_overlong() {
         assert!(is_invalid(check_id("owner_id", "")));
-        assert!(is_invalid(check_id("owner_id", &"x".repeat(MAX_ID_LEN + 1))));
+        assert!(is_invalid(check_id(
+            "owner_id",
+            &"x".repeat(MAX_ID_LEN + 1)
+        )));
         assert!(check_id("owner_id", "owner-42").is_ok());
     }
 

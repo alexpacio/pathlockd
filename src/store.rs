@@ -108,10 +108,17 @@ pub fn handler_of(path: &str) -> &str {
 /// A stored value. Set members each carry their own absolute expiry.
 #[derive(Debug, Clone, Serialize, Deserialize)]
 pub enum Stored {
-    Str { v: String, exp: u64 },
+    Str {
+        v: String,
+        exp: u64,
+    },
     /// member -> absolute expiry in epoch-ms (`0` = never expires).
-    Set { m: BTreeMap<String, u64> },
-    Counter { v: i64 },
+    Set {
+        m: BTreeMap<String, u64>,
+    },
+    Counter {
+        v: i64,
+    },
 }
 
 impl Stored {
@@ -338,7 +345,9 @@ impl Tx {
             Some(Stored::Str { v, .. }) => v.parse::<i64>().unwrap_or(0),
             _ => 0,
         };
-        let next = cur + 1;
+        let next = cur
+            .checked_add(1)
+            .ok_or_else(|| anyhow::anyhow!("fencing counter overflow"))?;
         self.raw_put(key, &Stored::Counter { v: next }).await?;
         Ok(next)
     }

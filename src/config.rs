@@ -71,7 +71,11 @@ struct FileConfig {
 }
 
 #[derive(Parser, Debug)]
-#[command(name = "pathlockd", version, about = "Hierarchical path-locking daemon over TiKV")]
+#[command(
+    name = "pathlockd",
+    version,
+    about = "Hierarchical path-locking daemon over TiKV"
+)]
 struct Cli {
     /// Path to a TOML config file.
     #[arg(long, env = "PATHLOCKD_CONFIG")]
