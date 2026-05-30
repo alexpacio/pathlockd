@@ -21,7 +21,7 @@
 #   - Cargo.toml's [package] version == <tag> without the leading 'v'
 #     (if it doesn't match and --dry-run is NOT set, Cargo.toml + Cargo.lock
 #     are bumped and committed automatically);
-#   - the tag (local + remote) and a GitHub release for it do not yet exist.
+#   - existing local tag, remote tag, or GitHub release are skipped (idempotent).
 #
 # Docker images are published automatically by the GitHub Actions workflow on
 # every v* tag push; use --docker only for local / manual image builds.
@@ -101,14 +101,15 @@ BRANCH="$(git rev-parse --abbrev-ref HEAD)"
 [ "$BRANCH" = "main" ] || warn "releasing from branch '$BRANCH' (not main)"
 [ -z "$(git status --porcelain)" ] || die "working tree is dirty — commit or stash before releasing"
 
-exists_abort() { # message
-  if [ "$DRY_RUN" = 1 ]; then warn "$1 (dry-run: continuing)"; else die "$1"; fi
-}
-git rev-parse -q --verify "refs/tags/$TAG" >/dev/null && exists_abort "local tag $TAG already exists"
+LOCAL_TAG_EXISTS=0; REMOTE_TAG_EXISTS=0; RELEASE_EXISTS=0
+
+git rev-parse -q --verify "refs/tags/$TAG" >/dev/null \
+  && LOCAL_TAG_EXISTS=1 && warn "local tag $TAG already exists — will skip tagging"
 git fetch --quiet --tags origin 2>/dev/null || warn "git fetch failed (continuing)"
 git ls-remote --exit-code --tags origin "refs/tags/$TAG" >/dev/null 2>&1 \
-  && exists_abort "remote tag $TAG already exists"
-gh release view "$TAG" >/dev/null 2>&1 && exists_abort "GitHub release $TAG already exists"
+  && REMOTE_TAG_EXISTS=1 && warn "remote tag $TAG already exists — will skip tag push"
+gh release view "$TAG" >/dev/null 2>&1 \
+  && RELEASE_EXISTS=1 && warn "GitHub release $TAG already exists — will skip release creation"
 
 if git rev-parse -q --verify "refs/remotes/origin/$BRANCH" >/dev/null; then
   git merge-base --is-ancestor "origin/$BRANCH" HEAD \
@@ -166,21 +167,36 @@ if [ "$DRY_RUN" = 1 ]; then
 fi
 
 # ---------------------------------------------------------------- publish (irreversible)
-note "tagging $TAG (annotated; message from $NOTES) …"
-git tag -a "$TAG" -F "$NOTES"
-note "pushing $BRANCH and tag $TAG …"
+if [ "$LOCAL_TAG_EXISTS" = 0 ]; then
+  note "tagging $TAG (annotated; message from $NOTES) …"
+  git tag -a "$TAG" -F "$NOTES"
+else
+  note "local tag $TAG already exists — skipping."
+fi
+
+note "pushing $BRANCH …"
 git push origin "$BRANCH"
-git push origin "$TAG"
+
+if [ "$REMOTE_TAG_EXISTS" = 0 ]; then
+  note "pushing tag $TAG …"
+  git push origin "$TAG"
+else
+  note "remote tag $TAG already exists — skipping tag push."
+fi
 
 GH_FLAGS=(--title "$TAG" --notes-file "$NOTES" --verify-tag)
 [ "$PRERELEASE" = 1 ] && GH_FLAGS+=(--prerelease)
 [ "$DRAFT" = 1 ] && GH_FLAGS+=(--draft)
-note "creating GitHub release $TAG …"
-if [ "$BUILD" = 1 ]; then
-  gh release create "$TAG" "${GH_FLAGS[@]}" \
-    "$DIST/$REL_TGZ" "$DIST/$DBG_TGZ" "$DIST/SHA256SUMS"
+if [ "$RELEASE_EXISTS" = 0 ]; then
+  note "creating GitHub release $TAG …"
+  if [ "$BUILD" = 1 ]; then
+    gh release create "$TAG" "${GH_FLAGS[@]}" \
+      "$DIST/$REL_TGZ" "$DIST/$DBG_TGZ" "$DIST/SHA256SUMS"
+  else
+    gh release create "$TAG" "${GH_FLAGS[@]}"
+  fi
 else
-  gh release create "$TAG" "${GH_FLAGS[@]}"
+  note "GitHub release $TAG already exists — skipping."
 fi
 
 if [ "$DOCKER" = 1 ]; then
@@ -188,20 +204,28 @@ if [ "$DOCKER" = 1 ]; then
   gh auth refresh -s write:packages
   gh auth token | docker login ghcr.io -u "$GH_USER" --password-stdin
 
-  note "pushing $GHCR_IMAGE:$VERSION (linux/amd64, linux/arm64) …"
-  docker buildx build \
-    --platform linux/amd64,linux/arm64 \
-    -t "$GHCR_IMAGE:$VERSION" \
-    --push \
-    .
+  if docker buildx imagetools inspect "$GHCR_IMAGE:$VERSION" >/dev/null 2>&1; then
+    note "$GHCR_IMAGE:$VERSION already exists — skipping multi-platform push."
+  else
+    note "pushing $GHCR_IMAGE:$VERSION (linux/amd64, linux/arm64) …"
+    docker buildx build \
+      --platform linux/amd64,linux/arm64 \
+      -t "$GHCR_IMAGE:$VERSION" \
+      --push \
+      .
+  fi
 
-  note "pushing $GHCR_IMAGE:$VERSION-x86-64-v4 (linux/amd64) …"
-  docker buildx build \
-    --platform linux/amd64 \
-    --build-arg RUSTFLAGS="-C target-cpu=x86-64-v4" \
-    -t "$GHCR_IMAGE:$VERSION-x86-64-v4" \
-    --push \
-    .
+  if docker buildx imagetools inspect "$GHCR_IMAGE:$VERSION-x86-64-v4" >/dev/null 2>&1; then
+    note "$GHCR_IMAGE:$VERSION-x86-64-v4 already exists — skipping x86-64-v4 push."
+  else
+    note "pushing $GHCR_IMAGE:$VERSION-x86-64-v4 (linux/amd64) …"
+    docker buildx build \
+      --platform linux/amd64 \
+      --build-arg RUSTFLAGS="-C target-cpu=x86-64-v4" \
+      -t "$GHCR_IMAGE:$VERSION-x86-64-v4" \
+      --push \
+      .
+  fi
 fi
 
 note "done:"
