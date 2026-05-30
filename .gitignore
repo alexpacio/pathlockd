@@ -4,3 +4,4 @@
 pathlockd.toml
 .env
 .claude/
+/dist/

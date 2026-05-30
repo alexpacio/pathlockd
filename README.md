@@ -226,6 +226,27 @@ docker compose -f docker-compose.dev.yml up -d
 
 See [`llmwiki/06-testing.md`](llmwiki/06-testing.md).
 
+## Releasing
+
+[`scripts/release.sh`](scripts/release.sh) builds the linux/amd64 artifacts,
+tags, pushes, and publishes the GitHub release in one shot.
+
+```bash
+# 1. bump the version in Cargo.toml, commit it
+# 2. write the release notes for the tag:
+#      release_notes/v0.1.2/gh.md      # used as the release body + tag message
+# 3. publish (tag must match Cargo.toml; tree must be clean):
+./scripts/release.sh v0.1.2
+
+# preview without tagging/pushing/publishing:
+./scripts/release.sh --dry-run v0.1.2
+# extra flags: --prerelease, --draft
+```
+
+It refuses to run on a dirty tree, on a version/tag mismatch, or if the tag or
+release already exists. Artifacts land in `dist/<tag>/` (release + debug
+tarballs + `SHA256SUMS`).
+
 ## License
 
 [AGPL-3.0-or-later](LICENSE).
