@@ -14,7 +14,7 @@
 
 services:
   pd:
-    image: pingcap/pd:latest
+    image: pingcap/pd:v8.5.6
     command:
       - --name=pd
       - --data-dir=/data/pd
@@ -25,7 +25,7 @@ services:
       - --initial-cluster=pd=http://pd:2380
 
   tikv:
-    image: pingcap/tikv:latest
+    image: pingcap/tikv:v8.5.6
     command:
       - --addr=0.0.0.0:20160
       - --advertise-addr=tikv:20160
