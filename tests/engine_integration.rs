@@ -1,10 +1,11 @@
 //! Engine-level integration tests against a real TiKV cluster.
 //!
-//! These mirror the behaviours asserted by the storage-api Redis path-lock
-//! specs (`tests/drivers/redisLockStorage.*.spec.ts`), but at the level of the
-//! primitives pathlockd exposes — hierarchical conflict precedence, point-only
-//! reads, fencing, lock-loss, dead-reader pruning, deadlock cycle detection,
-//! is-blocking, inline shadowing release and release-all.
+//! These pin down the lock contract at the level of the primitives pathlockd
+//! exposes — the read/write conflict matrix and its hierarchical precedence,
+//! point-only reads, same-owner re-entrancy, fencing, lock-loss, dead-reader
+//! pruning, deadlock cycle detection, is-blocking, inline shadowing release and
+//! release-all. The behaviours asserted here are specified in
+//! `docs/locking-semantics.md`.
 //!
 //! Run against a cluster reachable from the test process. They flush the whole
 //! keyspace between tests, so run serially:
@@ -601,6 +602,203 @@ fn release_all_clears_everything() {
         assert_eq!(
             engine::debug_get_write_owner(c, &rp("/x")).await.unwrap(),
             None
+        );
+    });
+}
+
+// --- Conflict-matrix completeness: cells the suite above did not yet pin down ---
+
+// Only one writer may hold a given path: a second writer on the exact same path
+// conflicts (write_locked), naming the incumbent owner.
+#[test]
+fn same_path_write_write_conflicts() {
+    run(async {
+        let c = fresh().await;
+        assert_eq!(
+            acq(c, "A", vec![w("/x", State::New)], 1).await,
+            AcquireOutcome::Ok
+        );
+        match acq(c, "B", vec![w("/x", State::New)], 2).await {
+            AcquireOutcome::Conflict {
+                reason,
+                owner,
+                path,
+            } => {
+                assert_eq!(reason, "write_locked");
+                assert_eq!(owner, "A");
+                assert_eq!(path, rp("/x"));
+            }
+            o => panic!("expected write_locked, got {o:?}"),
+        }
+    });
+}
+
+// The fourth quadrant of the asymmetry: a point read deep in the subtree blocks
+// a write on the covering ancestor (the write would mutate the read's node).
+#[test]
+fn descendant_read_blocks_ancestor_write() {
+    run(async {
+        let c = fresh().await;
+        assert_eq!(
+            acq(c, "R", vec![r("/a/b", State::New)], 1).await,
+            AcquireOutcome::Ok
+        );
+        match acq(c, "W", vec![w("/a", State::New)], 2).await {
+            AcquireOutcome::Conflict { reason, owner, .. } => {
+                assert_eq!(reason, "descendant_read_locked");
+                assert_eq!(owner, "R");
+            }
+            o => panic!("expected descendant_read_locked, got {o:?}"),
+        }
+    });
+}
+
+// An owner never conflicts with itself: it may hold overlapping locks (ancestor
+// + descendant writes, a read on a path it write-covers) and re-acquire
+// idempotently — while a different owner stays excluded from the whole subtree.
+#[test]
+fn same_owner_reentrant_overlapping_paths() {
+    run(async {
+        let c = fresh().await;
+        assert_eq!(
+            acq(c, "O", vec![w("/a", State::New)], 1).await,
+            AcquireOutcome::Ok
+        );
+        // descendant write under an ancestor write the same owner already holds
+        assert_eq!(
+            acq(c, "O", vec![w("/a/b", State::New)], 1).await,
+            AcquireOutcome::Ok
+        );
+        // a read on a path the same owner write-covers
+        assert_eq!(
+            acq(c, "O", vec![r("/a", State::New)], 1).await,
+            AcquireOutcome::Ok
+        );
+        // re-acquiring an owned path is idempotent
+        assert_eq!(
+            acq(c, "O", vec![w("/a", State::New)], 1).await,
+            AcquireOutcome::Ok
+        );
+        // a *different* owner is still excluded from the subtree
+        match acq(c, "X", vec![w("/a/b/c", State::New)], 2).await {
+            AcquireOutcome::Conflict { reason, owner, .. } => {
+                assert_eq!(reason, "ancestor_locked");
+                assert_eq!(owner, "O");
+            }
+            o => panic!("expected ancestor_locked, got {o:?}"),
+        }
+    });
+}
+
+// Locks whose regions do not intersect coexist within the same handler: sibling
+// leaves under a shared parent, and disjoint roots.
+#[test]
+fn unrelated_paths_same_handler_coexist() {
+    run(async {
+        let c = fresh().await;
+        assert_eq!(
+            acq(c, "A", vec![w("/p/a", State::New)], 1).await,
+            AcquireOutcome::Ok
+        );
+        assert_eq!(
+            acq(c, "B", vec![w("/p/b", State::New)], 2).await,
+            AcquireOutcome::Ok
+        );
+        assert_eq!(
+            acq(c, "C", vec![w("/q", State::New)], 3).await,
+            AcquireOutcome::Ok
+        );
+    });
+}
+
+// Reads never conflict with reads: many owners share one node, and readers on an
+// ancestor, a descendant and the root all coexist.
+#[test]
+fn many_readers_share_across_hierarchy() {
+    run(async {
+        let c = fresh().await;
+        assert_eq!(
+            acq(c, "r1", vec![r("/a", State::New)], 1).await,
+            AcquireOutcome::Ok
+        );
+        assert_eq!(
+            acq(c, "r2", vec![r("/a", State::New)], 2).await,
+            AcquireOutcome::Ok
+        );
+        assert_eq!(
+            acq(c, "r3", vec![r("/a/b", State::New)], 3).await,
+            AcquireOutcome::Ok
+        );
+        assert_eq!(
+            acq(c, "r4", vec![r("/", State::New)], 4).await,
+            AcquireOutcome::Ok
+        );
+    });
+}
+
+// AssertFencing's second guard: the owner still holds the write, but the
+// persisted fence has moved past its token → stale_fencing_token (the first
+// guard, stale_owner, is covered by assert_fencing_ok_and_stale_owner).
+#[test]
+fn assert_fencing_detects_stale_token() {
+    run(async {
+        let c = fresh().await;
+        assert_eq!(
+            acq(c, "own", vec![w("/p", State::New)], 4).await,
+            AcquireOutcome::Ok
+        );
+        engine::debug_set_fence(c, &rp("/p"), 9).await.unwrap();
+        match engine::assert_fencing(c, "own", 4, &[rp("/p")])
+            .await
+            .unwrap()
+        {
+            AssertOutcome::Fail { reason, .. } => assert_eq!(reason, "stale_fencing_token"),
+            o => panic!("expected stale_fencing_token, got {o:?}"),
+        }
+    });
+}
+
+// Re-validating a Held write whose persisted fence advanced past the owner's
+// token surfaces stale_fencing_token, with the persisted fence in `owner`.
+#[test]
+fn held_write_with_advanced_fence_conflicts() {
+    run(async {
+        let c = fresh().await;
+        assert_eq!(
+            acq(c, "o", vec![w("/p", State::New)], 5).await,
+            AcquireOutcome::Ok
+        );
+        engine::debug_set_fence(c, &rp("/p"), 11).await.unwrap();
+        match acq(c, "o", vec![w("/p", State::Held)], 5).await {
+            AcquireOutcome::Conflict { reason, owner, .. } => {
+                assert_eq!(reason, "stale_fencing_token");
+                assert_eq!(owner, "11");
+            }
+            o => panic!("expected stale_fencing_token, got {o:?}"),
+        }
+    });
+}
+
+// Force-releasing a holder drops all its keys and frees the subtree, so a
+// previously-blocked owner can then acquire.
+#[test]
+fn force_release_unblocks_a_waiter() {
+    run(async {
+        let c = fresh().await;
+        assert_eq!(
+            acq(c, "victim", vec![w("/k", State::New)], 1).await,
+            AcquireOutcome::Ok
+        );
+        match acq(c, "other", vec![w("/k", State::New)], 2).await {
+            AcquireOutcome::Conflict { reason, .. } => assert_eq!(reason, "write_locked"),
+            o => panic!("expected write_locked, got {o:?}"),
+        }
+        engine::force_release(c, "victim").await.unwrap();
+        let (members, alive) = engine::debug_owned_paths(c, "victim").await.unwrap();
+        assert!(members.is_empty() && !alive, "victim state should be gone");
+        assert_eq!(
+            acq(c, "other", vec![w("/k", State::New)], 3).await,
+            AcquireOutcome::Ok
         );
     });
 }

@@ -40,12 +40,24 @@ You need locks that understand **containment**:
 pathlockd enforces this containment directly, with O(subtree) conflict checks
 (not O(keyspace)) via descendant indexes.
 
+> **It's a reader-writer lock — but not the textbook one.** A classic RWLock is
+> *symmetric and flat*: one key, readers share, a writer is exclusive. pathlockd
+> keeps the shared-readers / exclusive-writer rule but generalizes it to a tree
+> **asymmetrically**: a **write** claims its entire subtree, while a **read**
+> claims only its single node. So a write and a read collide *only when the
+> write's subtree contains the read's node* — an ancestor read does **not** cover
+> its descendants, and a descendant write does **not** block an ancestor read.
+> That asymmetry (and the precedence between conflict reasons) is the part most
+> worth understanding before you use it — read
+> **[docs/locking-semantics.md](docs/locking-semantics.md)**, the normative spec
+> for the full conflict matrix, fencing, leases, and re-entrancy rules.
+
 ## Core concepts
 
 | Concept | What it does |
 |---|---|
 | **Owner** | A caller-supplied id that owns a lock and all the paths it holds. |
-| **Read / write modes** | Writes cover the subtree; reads are point-only (RWLock semantics). |
+| **Read / write modes** | Shared readers, exclusive writer — but hierarchical, not flat: a write covers its whole subtree, a read covers only its node. A tree-shaped RWLock, not the symmetric textbook one. Full rules: [docs/locking-semantics.md](docs/locking-semantics.md). |
 | **Fencing token** | A monotonic token stamped on every write-locked path. A holder can `AssertFencing` to prove it still owns a path at its token; a stale token is rejected, so a paused-then-resumed writer can't corrupt newer state. |
 | **TTL lease + renewal** | Every lock is a lease. The holder renews it; if the holder dies, the lease expires and the subtree frees itself — no orphaned locks. |
 | **Liveness & pruning** | Read sets self-heal: members whose owner lease has lapsed are pruned on the next touch. |
