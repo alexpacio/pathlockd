@@ -155,6 +155,7 @@ gh release create "$TAG" "${GH_FLAGS[@]}" \
   "$DIST/$REL_TGZ" "$DIST/$DBG_TGZ" "$DIST/SHA256SUMS"
 
 note "logging in to ghcr.io as $GH_USER …"
+gh auth refresh -s write:packages
 gh auth token | docker login ghcr.io -u "$GH_USER" --password-stdin
 note "pushing $GHCR_IMAGE:$VERSION and :latest …"
 docker push "$GHCR_IMAGE:$VERSION"

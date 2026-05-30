@@ -132,6 +132,49 @@ filesystem, see the [**usage guide**](docs/usage-virtual-filesystem.md).
 Linux **x86_64 (amd64)** only, at the moment. The provided container images and
 the Node.js client target `linux/amd64`.
 
+## Running from the container image
+
+Pre-built images are published to GHCR on every release:
+
+```text
+ghcr.io/alexpacio/pathlockd:0.1.3   # pinned
+ghcr.io/alexpacio/pathlockd:latest  # latest release
+```
+
+**Dependency — TiKV cluster.** pathlockd stores all state in TiKV and needs
+one or more PD (Placement Driver) endpoints. For a local playground a
+single-node cluster is enough:
+
+```bash
+# start a single-node TiKV + PD (playground only — not HA)
+docker run -d --name pd -p 2379:2379 pingcap/pd:latest \
+  --client-urls=http://0.0.0.0:2379 --advertise-client-urls=http://127.0.0.1:2379
+docker run -d --name tikv --network=container:pd pingcap/tikv:latest \
+  --pd-endpoints=127.0.0.1:2379
+```
+
+**Run pathlockd:**
+
+```bash
+docker run -d --restart=unless-stopped \
+  -p 50051:50051 \
+  -e PATHLOCKD_PD_ENDPOINTS="127.0.0.1:2379" \
+  ghcr.io/alexpacio/pathlockd:latest
+```
+
+**Key env vars** (see [Configuration](#configuration) for the full list):
+
+| Env var | Default | Notes |
+|---|---|---|
+| `PATHLOCKD_PD_ENDPOINTS` | `127.0.0.1:2379` | Comma-separated PD addresses — set this in any non-local deployment |
+| `PATHLOCKD_LISTEN` | `0.0.0.0:50051` | gRPC bind address |
+| `PATHLOCKD_PEERS` | *(none)* | Comma-separated sibling pathlockd addresses; needed only when clients are not sticky to one replica |
+| `PATHLOCKD_LOG_LEVEL` | `info` | `trace` / `debug` / `info` / `warn` / `error` |
+
+The daemon runs as a non-root user (`uid 10001`) and exposes a liveness
+`HEALTHCHECK` via `--health-check`. Never set `PATHLOCKD_ENABLE_DEBUG=true`
+in production.
+
 ## Quick start (development / playground)
 
 Brings up a single-node TiKV (PD + TiKV) and pathlockd; only the gRPC port is
