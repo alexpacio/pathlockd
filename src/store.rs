@@ -191,8 +191,7 @@ pub fn expiry_at(now: u64, ttl_ms: u64) -> u64 {
 }
 
 fn encode(s: &Stored) -> Vec<u8> {
-    bincode::serde::encode_to_vec(s, bincode::config::standard())
-        .expect("bincode serialize Stored")
+    bincode::serde::encode_to_vec(s, bincode::config::standard()).expect("bincode serialize Stored")
 }
 
 fn decode(b: &[u8]) -> anyhow::Result<Stored> {

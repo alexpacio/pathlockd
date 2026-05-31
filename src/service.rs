@@ -163,19 +163,23 @@ fn check_blocking_reason(reason: &str) -> Result<(), Status> {
     }
 }
 
-fn to_mode(i: i32) -> engine::Mode {
-    if i == proto::Mode::Read as i32 {
-        engine::Mode::Read
-    } else {
-        engine::Mode::Write
+#[allow(clippy::result_large_err)]
+fn to_mode(i: i32) -> Result<engine::Mode, Status> {
+    match proto::Mode::try_from(i) {
+        Ok(proto::Mode::Read) => Ok(engine::Mode::Read),
+        Ok(proto::Mode::Write) => Ok(engine::Mode::Write),
+        Err(_) => Err(Status::invalid_argument(format!("invalid mode value {i}"))),
     }
 }
 
-fn to_state(i: i32) -> engine::State {
-    if i == proto::LockState::Held as i32 {
-        engine::State::Held
-    } else {
-        engine::State::New
+#[allow(clippy::result_large_err)]
+fn to_state(i: i32) -> Result<engine::State, Status> {
+    match proto::LockState::try_from(i) {
+        Ok(proto::LockState::Held) => Ok(engine::State::Held),
+        Ok(proto::LockState::New) => Ok(engine::State::New),
+        Err(_) => Err(Status::invalid_argument(format!(
+            "invalid lock state value {i}"
+        ))),
     }
 }
 
@@ -222,20 +226,24 @@ impl PathLock for PathLockService {
         let requests: Vec<LockReq> = req
             .requests
             .iter()
-            .map(|r| LockReq {
-                path: r.path.clone(),
-                mode: to_mode(r.mode),
-                state: to_state(r.state),
+            .map(|r| {
+                Ok(LockReq {
+                    path: r.path.clone(),
+                    mode: to_mode(r.mode)?,
+                    state: to_state(r.state)?,
+                })
             })
-            .collect();
+            .collect::<Result<_, Status>>()?;
         let release_requests: Vec<RelReq> = req
             .release_requests
             .iter()
-            .map(|r| RelReq {
-                path: r.path.clone(),
-                mode: to_mode(r.mode),
+            .map(|r| {
+                Ok(RelReq {
+                    path: r.path.clone(),
+                    mode: to_mode(r.mode)?,
+                })
             })
-            .collect();
+            .collect::<Result<_, Status>>()?;
         let had_release = !release_requests.is_empty();
 
         let args = AcquireArgs {
@@ -298,11 +306,13 @@ impl PathLock for PathLockService {
         let reqs: Vec<RelReq> = req
             .requests
             .iter()
-            .map(|r| RelReq {
-                path: r.path.clone(),
-                mode: to_mode(r.mode),
+            .map(|r| {
+                Ok(RelReq {
+                    path: r.path.clone(),
+                    mode: to_mode(r.mode)?,
+                })
             })
-            .collect();
+            .collect::<Result<_, Status>>()?;
         engine::release(&self.client, &req.owner_id, &reqs, req.del_wait_key)
             .await
             .map_err(engine_err)?;
@@ -613,7 +623,7 @@ impl PathLockDebug for DebugService {
         } else {
             Some(req.owner_id)
         };
-        engine::debug_delete_lock_key(&self.client, &req.path, to_mode(req.mode), owner)
+        engine::debug_delete_lock_key(&self.client, &req.path, to_mode(req.mode)?, owner)
             .await
             .map_err(internal)?;
         Ok(Response::new(DebugAck {}))
@@ -765,5 +775,28 @@ mod tests {
         assert!(is_invalid(check_blocking_reason("stale_fencing_token")));
         assert!(is_invalid(check_blocking_reason("")));
         assert!(is_invalid(check_blocking_reason("garbage")));
+    }
+
+    #[test]
+    fn enum_decoding_rejects_unknown_values() {
+        assert_eq!(
+            to_mode(proto::Mode::Write as i32).unwrap(),
+            engine::Mode::Write
+        );
+        assert_eq!(
+            to_mode(proto::Mode::Read as i32).unwrap(),
+            engine::Mode::Read
+        );
+        assert!(is_invalid(to_mode(99).map(|_| ())));
+
+        assert_eq!(
+            to_state(proto::LockState::New as i32).unwrap(),
+            engine::State::New
+        );
+        assert_eq!(
+            to_state(proto::LockState::Held as i32).unwrap(),
+            engine::State::Held
+        );
+        assert!(is_invalid(to_state(99).map(|_| ())));
     }
 }

@@ -429,7 +429,9 @@ async fn acquire_inner(tx: &mut Tx, args: &AcquireArgs) -> anyhow::Result<Acquir
         if requested.contains(&member) {
             continue; // already refreshed above, with full New/Held handling
         }
-        let Some(sep) = member.find(':') else { continue };
+        let Some(sep) = member.find(':') else {
+            continue;
+        };
         let (mode, path) = (&member[..sep], member[sep + 1..].to_string());
         if mode == "write" {
             let wr_k = wr_key(&path);
