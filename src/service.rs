@@ -142,14 +142,16 @@ fn check_path(path: &str) -> Result<(), Status> {
 
 /// The conflict reasons `IsBlocking` knows how to re-check — the lock-held
 /// reasons a waiter blocks on. `is_blocking_inner` reads the two `*read_locked`
-/// reasons as a read re-check and the rest as a write re-check, so an
-/// unrecognized value would silently fall through to the write path; reject it.
-const BLOCKING_REASONS: [&str; 5] = [
+/// reasons as a read re-check, `preempt_claimed` as a claim re-check, and the
+/// rest as a write re-check, so an unrecognized value would silently fall
+/// through to the write path; reject it.
+const BLOCKING_REASONS: [&str; 6] = [
     "ancestor_locked",
     "write_locked",
     "read_locked",
     "descendant_write_locked",
     "descendant_read_locked",
+    engine::REASON_PREEMPT_CLAIMED,
 ];
 
 #[allow(clippy::result_large_err)]
@@ -557,6 +559,26 @@ impl PathLock for PathLockService {
     ) -> Result<Response<RequestRevokeResponse>, Status> {
         let req = request.into_inner();
         check_id("owner_id", &req.owner_id)?;
+        // Plant the preemption claim (if requested) BEFORE publishing the
+        // revoke, so the claim is durably visible by the time the victim reacts
+        // and its manager tries to re-acquire. A failure here is non-fatal: the
+        // revoke itself (plus client-side backoff) still resolves the deadlock,
+        // just without the extra race protection.
+        if !req.claim_path.is_empty() && !req.claimant_owner_id.is_empty() {
+            check_id("claimant_owner_id", &req.claimant_owner_id)?;
+            if let Err(e) =
+                engine::set_claim(&self.client, &req.claim_path, &req.claimant_owner_id, req.claim_ttl_ms)
+                    .await
+            {
+                tracing::warn!(
+                    owner_id = %req.owner_id,
+                    claim_path = %req.claim_path,
+                    claimant = %req.claimant_owner_id,
+                    error = %e,
+                    "fslock: failed to plant preemption claim; proceeding with revoke only"
+                );
+            }
+        }
         self.broadcaster.revoke(&req.owner_id);
         Ok(Response::new(RequestRevokeResponse {}))
     }

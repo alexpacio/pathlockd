@@ -11,13 +11,24 @@ use tikv_client::TransactionClient;
 use tracing::warn;
 
 use crate::store::{
-    alive_key, fence_key, handler_of, own_key, rd_key, rddesc_key, wait_key, wr_key, wrdesc_key,
-    Tx, FENCE_MIN_TTL_MS, FENCING_COUNTER_KEY,
+    alive_key, claim_key, fence_key, handler_of, own_key, rd_key, rddesc_key, wait_key, wr_key,
+    wrdesc_key, Tx, FENCE_MIN_TTL_MS, FENCING_COUNTER_KEY,
 };
 
 /// Above this many descendant-index members a single scan starts to
 /// noticeably block, so we log it.
 const SCAN_WARN_THRESHOLD: usize = 1024;
+
+/// Fallback TTL for a preemption claim when the caller does not specify one.
+/// Kept short: a claim only has to bridge the window between the victim
+/// releasing and the winner acquiring, and it self-heals via expiry if the
+/// winner dies before claiming.
+const CLAIM_DEFAULT_TTL_MS: u64 = 3000;
+
+/// The reason string reported when an acquire is blocked by another owner's
+/// live preemption claim. The client treats it as an ordinary transient
+/// conflict (wait + recheck), and [`is_blocking_inner`] knows how to verify it.
+pub const REASON_PREEMPT_CLAIMED: &str = "preempt_claimed";
 
 // ---------------------------------------------------------------------------
 // Public value types (engine-internal; the gRPC service maps proto <-> these)
@@ -184,6 +195,45 @@ async fn get_live_write_owner(tx: &mut Tx, path: &str) -> anyhow::Result<Option<
 
     tx.del(&wr_key(path)).await?;
     remove_descendant_indexes(tx, Mode::Write, path).await?;
+    Ok(None)
+}
+
+/// Returns the claimant of a live preemption claim on `path`, or `None`. A
+/// claim whose claimant is no longer alive is pruned and treated as absent, so
+/// a dead winner can never block acquisition (mirrors [`get_live_write_owner`]).
+async fn get_live_claim(tx: &mut Tx, path: &str) -> anyhow::Result<Option<String>> {
+    let claim_k = claim_key(path);
+    let Some(claimant) = tx.get_str(&claim_k).await? else {
+        return Ok(None);
+    };
+    if owner_alive(tx, &claimant).await? {
+        return Ok(Some(claimant));
+    }
+    tx.del(&claim_k).await?;
+    Ok(None)
+}
+
+/// First live claim held by another owner on `path` or any of its ancestors,
+/// returned as a ready conflict outcome. A claim behaves like a brief exclusive
+/// reservation: it blocks both read and write acquires, since the claimant is
+/// about to take a write lock on the contended path.
+async fn find_blocking_claim(
+    tx: &mut Tx,
+    owner: &str,
+    path: &str,
+) -> anyhow::Result<Option<AcquireOutcome>> {
+    if let Some(claimant) = get_live_claim(tx, path).await? {
+        if claimant != *owner {
+            return Ok(Some(conflict(path, &claimant, REASON_PREEMPT_CLAIMED)));
+        }
+    }
+    for anc in get_ancestors(path) {
+        if let Some(claimant) = get_live_claim(tx, &anc).await? {
+            if claimant != *owner {
+                return Ok(Some(conflict(&anc, &claimant, REASON_PREEMPT_CLAIMED)));
+            }
+        }
+    }
     Ok(None)
 }
 
@@ -359,6 +409,12 @@ async fn acquire_inner(tx: &mut Tx, args: &AcquireArgs) -> anyhow::Result<Acquir
                         return Ok(conflict(path, &wr_owner, "write_locked"));
                     }
                 }
+                // B'. another owner's preemption claim on this path or an
+                // ancestor reserves it for the deadlock winner; block until it
+                // expires or the winner converts it into a real lock.
+                if let Some(outcome) = find_blocking_claim(tx, owner, path).await? {
+                    return Ok(outcome);
+                }
                 if req.mode == Mode::Write {
                     // Reads are point-only: an ancestor read does not cover this path.
                     let rd_owners = prune_dead_read_owners(tx, &rd_key(path)).await?;
@@ -404,6 +460,15 @@ async fn acquire_inner(tx: &mut Tx, args: &AcquireArgs) -> anyhow::Result<Acquir
         let path = &req.path;
         let member = format!("{}:{}", req.mode.as_str(), path);
         tx.sadd(&own_k, &member, ttl).await?;
+
+        // We are taking (or refreshing) this path, so any preemption claim we
+        // planted on it has served its purpose — drop it so it stops blocking
+        // unrelated owners for the rest of its TTL. Claims owned by others were
+        // already rejected in the validation phase.
+        let claim_k = claim_key(path);
+        if tx.get_str(&claim_k).await?.as_deref() == Some(owner.as_str()) {
+            tx.del(&claim_k).await?;
+        }
 
         if req.mode == Mode::Write {
             let wr_k = wr_key(path);
@@ -975,6 +1040,15 @@ async fn is_blocking_inner(
     conflict_owner: &str,
     reason: &str,
 ) -> anyhow::Result<bool> {
+    // A preemption claim blocks for as long as the claim is live and owned by
+    // the same owner. Without this, the recheck would fall through to the
+    // write-owner test below, see no write lock (the winner hasn't acquired
+    // yet), report "not blocking", and the victim would hot-spin retrying its
+    // acquire against the still-present claim.
+    if reason == REASON_PREEMPT_CLAIMED {
+        return Ok(get_live_claim(tx, conflict_path).await?.as_deref() == Some(conflict_owner));
+    }
+
     let is_read = reason == "read_locked" || reason == "descendant_read_locked";
 
     if is_read {
@@ -1021,6 +1095,32 @@ pub async fn set_wait_edge(
 /// `DEL fslock:wait:<owner>`.
 pub async fn clear_wait_edge(client: &TransactionClient, owner: &str) -> anyhow::Result<()> {
     txn_retry!(client, tx => { tx.del(&wait_key(owner)).await })
+}
+
+/// Plant a preemption claim reserving `path` for `claimant` for `ttl_ms`
+/// (falling back to [`CLAIM_DEFAULT_TTL_MS`] when zero). The deadlock winner
+/// calls this just before publishing the cooperative REVOKE, so by the time the
+/// victim releases and its manager tries to re-acquire, the claim is already
+/// durably visible and blocks the re-acquire. Serializing the path's handler
+/// orders this write against any concurrent acquire on the same handler, so the
+/// claim can't slip in unseen between a racing acquire's validation and commit.
+pub async fn set_claim(
+    client: &TransactionClient,
+    path: &str,
+    claimant: &str,
+    ttl_ms: u64,
+) -> anyhow::Result<()> {
+    let ttl = if ttl_ms == 0 {
+        CLAIM_DEFAULT_TTL_MS
+    } else {
+        ttl_ms
+    };
+    txn_retry!(client, tx => {
+        async {
+            tx.serialize_handler(handler_of(path)).await?;
+            tx.set_str(&claim_key(path), claimant, ttl).await
+        }.await
+    })
 }
 
 /// `EXISTS fslock:alive:<owner>`.

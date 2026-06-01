@@ -85,6 +85,13 @@ pub fn own_key(owner: &str) -> String {
 pub fn wait_key(owner: &str) -> String {
     format!("{PREFIX}wait:{owner}")
 }
+/// A short-lived preemption reservation on a path, planted by the deadlock
+/// winner when it cooperatively revokes a victim. While live it blocks every
+/// owner *except* the claimant from (re-)acquiring the path, closing the race
+/// where the revoked victim re-grabs the path before the winner can claim it.
+pub fn claim_key(rpath: &str) -> String {
+    format!("{PREFIX}claim:{rpath}")
+}
 pub fn wrdesc_key(anc: &str) -> String {
     format!("{PREFIX}idx:wrdesc:{anc}")
 }

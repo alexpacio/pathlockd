@@ -236,6 +236,14 @@ message IsOwnerAliveResponse {
 
 message RequestRevokeRequest {
   string owner_id = 1;
+  // Optional preemption claim. When claim_path and claimant_owner_id are both
+  // set, the daemon reserves claim_path for claimant_owner_id (for
+  // claim_ttl_ms, or a short default when 0) before publishing the REVOKE, so
+  // the revoked victim cannot re-acquire the path before the winner does.
+  // Omitting them yields the legacy pure-notification behavior.
+  string claim_path = 2;
+  string claimant_owner_id = 3;
+  uint64 claim_ttl_ms = 4;
 }
 
 message RequestRevokeResponse {}
