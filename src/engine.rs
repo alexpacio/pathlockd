@@ -2,12 +2,12 @@
 //!
 //! Each public function is one primitive: acquire, release, release-all, renew,
 //! force-release, assert-fencing, detect-cycle, is-blocking, plus the
-//! single-key helpers (fencing counter, wait edges, liveness). Conflict
+//! single-key helpers (PD-backed fencing tokens, wait edges, liveness). Conflict
 //! precedence, dead-owner pruning, fencing rules and TTL refreshes are all
 //! enforced here, inside a single serialized transaction per multi-key
 //! operation.
 
-use tikv_client::TransactionClient;
+use tikv_client::{TimestampExt, TransactionClient};
 use tracing::warn;
 
 use crate::store::{
@@ -1075,9 +1075,28 @@ async fn is_blocking_inner(
 // Plain single-key ops
 // ---------------------------------------------------------------------------
 
-/// `INCR fslock:fencing:counter` — single key, no global mutex needed.
+/// Return a monotonic fencing token from PD's timestamp oracle. This avoids a
+/// single global TiKV counter hot key while preserving cluster-wide ordering.
 pub async fn incr_fencing_token(client: &TransactionClient) -> anyhow::Result<i64> {
-    txn_retry!(client, tx => { tx.incr(FENCING_COUNTER_KEY).await })
+    let mut attempt = 0;
+    loop {
+        match client.current_timestamp().await {
+            Ok(ts) => {
+                let version = ts.version();
+                return i64::try_from(version)
+                    .map_err(|_| anyhow::anyhow!("PD timestamp {version} exceeds i64"));
+            }
+            Err(e) => {
+                let err: anyhow::Error = e.into();
+                if attempt < crate::store::MAX_RETRY && crate::store::is_retryable(&err) {
+                    attempt += 1;
+                    crate::store::backoff(attempt).await;
+                    continue;
+                }
+                return Err(err);
+            }
+        }
+    }
 }
 
 /// `SET fslock:wait:<owner> <conflict>[+metadata] PX ttl`.

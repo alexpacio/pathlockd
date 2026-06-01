@@ -9,20 +9,19 @@
 //! * Each logical entry has a stable key string (`fslock:wr:...`,
 //!   `fslock:rd:...`, `fslock:own:...`, `fslock:idx:wrdesc:...`, etc.) so the
 //!   ancestor walk is a pure string operation.
-//! * Values are a tagged [`Stored`] enum: a `Str` (with an absolute expiry),
-//!   a `Set` (members each carrying their **own** absolute expiry), or a
-//!   non-expiring `Counter`.
+//! * Values are a tagged [`Stored`] enum: a `Str` (with an absolute expiry) or a
+//!   non-expiring `Counter`. Older deployments may still contain legacy `Set`
+//!   values; mutating set operations migrate those to the member-key layout.
 //! * **TTL is emulated**: writers stamp an absolute `expires_at` (ms since
 //!   epoch). Reads treat an elapsed entry as absent (*lazy expiry*, which gives
 //!   correctness), and a background [`gc_once`] sweep reclaims the bytes
 //!   (*active expiry*, purely housekeeping).
-//! * **Per-member set expiry.** A set keeps an expiry *per member*, not one for
-//!   the whole set. This is a correctness requirement: the read set and the
-//!   descendant indexes aggregate entries with independent lifetimes, so a
-//!   single set-wide expiry (last-writer-wins) could let a short-lived member
-//!   shorten the set below a longer-lived one and make a still-held lock
-//!   invisible to a conflict scan. With per-member expiry an entry stays visible
-//!   for exactly as long as the lock it mirrors. Writes are also *extend-only*
+//! * **Per-member set expiry.** Logical sets are stored as one TiKV key per
+//!   member (`fslock:setm:<set-key>:<member>`), and each member key carries its
+//!   own absolute expiry. This avoids rewriting a single giant set value and is
+//!   also a correctness requirement: read sets and descendant indexes aggregate
+//!   entries with independent lifetimes, so a single set-wide expiry could make
+//!   a still-held lock invisible to a conflict scan. Writes are *extend-only*
 //!   ([`merge_exp`]) so re-adding a member can never shorten it.
 //! * **Atomicity** comes from running each primitive as one optimistic TiKV
 //!   transaction. Multi-key mutations additionally write a per-handler
@@ -31,9 +30,9 @@
 //!   with a fresh snapshot — making them effectively serial *within that
 //!   handler* while still running in parallel across independent handlers,
 //!   without leaving a live marker for every handler ever seen.
-//!   Single-key operations (the fencing INCR, a wait-edge set/clear) and the
-//!   advisory walks (`detect_cycle`, `is_blocking`) skip it — TiKV already
-//!   serializes per key, and those walks are best-effort.
+//!   Single-key wait-edge set/clear operations and the advisory walks
+//!   (`detect_cycle`, `is_blocking`) skip it — TiKV already serializes per key,
+//!   and those walks are best-effort.
 
 use std::collections::{BTreeMap, HashSet};
 use std::time::{SystemTime, UNIX_EPOCH};
@@ -55,7 +54,7 @@ pub const PREFIX: &str = "fslock:";
 /// These keys live OUTSIDE the `fslock:` data range; only their MVCC tombstones
 /// matter.
 pub const SERIALIZE_PREFIX: &str = "pathlockd:__serialize__:";
-/// Monotonic fencing-token counter (`INCR fslock:fencing:counter`).
+/// Legacy/debug fencing-token counter key. Public token issuance now uses PD TSO.
 pub const FENCING_COUNTER_KEY: &str = "fslock:fencing:counter";
 
 /// Fence keys live far longer than lock keys so a stale token is still
@@ -64,6 +63,8 @@ pub const FENCE_MIN_TTL_MS: u64 = 86_400_000;
 
 /// Bounded retry budget for transient TiKV errors.
 pub const MAX_RETRY: u32 = 40;
+const SET_SCAN_PAGE: u32 = 1024;
+const SET_MEMBER_PREFIX: &str = "fslock:setm:";
 
 // --- key builders ---
 
@@ -121,7 +122,8 @@ pub enum Stored {
         v: String,
         exp: u64,
     },
-    /// member -> absolute expiry in epoch-ms (`0` = never expires).
+    /// Legacy set value from pre-member-key storage; mutating set operations
+    /// migrate it to `fslock:setm:*` keys.
     Set {
         m: BTreeMap<String, u64>,
     },
@@ -191,6 +193,18 @@ pub fn now_ms() -> u64 {
         .unwrap_or(0)
 }
 
+/// Cluster-authoritative wall-clock milliseconds from PD's timestamp oracle.
+/// TiKV timestamps carry a physical millisecond component plus a logical suffix;
+/// using the physical component keeps lease expiry consistent across pathlockd
+/// instances even when their host clocks differ.
+pub async fn cluster_now_ms(client: &TransactionClient) -> anyhow::Result<u64> {
+    let ts = client.current_timestamp().await?;
+    if ts.physical < 0 {
+        anyhow::bail!("PD returned a negative physical timestamp: {}", ts.physical);
+    }
+    Ok(ts.physical as u64)
+}
+
 #[inline]
 pub fn expired(exp: u64, now: u64) -> bool {
     exp != 0 && now >= exp
@@ -227,7 +241,56 @@ fn parse_counter_string(key: &str, value: &str) -> anyhow::Result<i64> {
 /// region not-leader, …) — all worth a bounded retry — or a decode bug, which
 /// is not a `tikv_client::Error` and therefore bubbles immediately.
 pub fn is_retryable(e: &anyhow::Error) -> bool {
-    e.downcast_ref::<tikv_client::Error>().is_some()
+    e.downcast_ref::<tikv_client::Error>()
+        .is_some_and(tikv_error_retryable)
+}
+
+fn tikv_error_retryable(e: &tikv_client::Error) -> bool {
+    use tikv_client::Error;
+
+    match e {
+        Error::ResolveLockError(_)
+        | Error::OnePcFailure
+        | Error::Io(_)
+        | Error::Channel(_)
+        | Error::Grpc(_)
+        | Error::Canceled(_)
+        | Error::RegionError(_)
+        | Error::NoCurrentRegions
+        | Error::EntryNotFoundInRegionCache
+        | Error::RegionForKeyNotFound { .. }
+        | Error::RegionForRangeNotFound { .. }
+        | Error::RegionNotFoundInResponse { .. }
+        | Error::LeaderNotFound { .. }
+        | Error::TxnNotFound(_) => true,
+        Error::GrpcAPI(status) => matches!(
+            format!("{:?}", status.code()).as_str(),
+            "Cancelled"
+                | "Unknown"
+                | "DeadlineExceeded"
+                | "ResourceExhausted"
+                | "Aborted"
+                | "Unavailable"
+        ),
+        Error::UndeterminedError(inner) => tikv_error_retryable(inner),
+        Error::ExtractedErrors(errs) | Error::MultipleKeyErrors(errs) => {
+            !errs.is_empty() && errs.iter().all(tikv_error_retryable)
+        }
+        Error::KeyError(k) => {
+            k.locked.is_some()
+                || !k.retryable.is_empty()
+                || k.conflict.is_some()
+                || k.deadlock.is_some()
+                || k.commit_ts_expired.is_some()
+                || k.commit_ts_too_large.is_some()
+        }
+        Error::PessimisticLockError { inner, .. } => tikv_error_retryable(inner),
+        Error::KvError { message } => {
+            let m = message.to_ascii_lowercase();
+            m.contains("retry") || m.contains("timeout") || m.contains("busy")
+        }
+        _ => false,
+    }
 }
 
 /// A small, dependency-free entropy source for retry jitter: a process-wide
@@ -252,6 +315,63 @@ pub async fn backoff(attempt: u32) {
     tokio::time::sleep(std::time::Duration::from_millis(base + jitter)).await;
 }
 
+fn hex_encode(bytes: &[u8]) -> String {
+    const HEX: &[u8; 16] = b"0123456789abcdef";
+    let mut out = String::with_capacity(bytes.len() * 2);
+    for &b in bytes {
+        out.push(HEX[(b >> 4) as usize] as char);
+        out.push(HEX[(b & 0x0f) as usize] as char);
+    }
+    out
+}
+
+fn hex_value(b: u8) -> Option<u8> {
+    match b {
+        b'0'..=b'9' => Some(b - b'0'),
+        b'a'..=b'f' => Some(b - b'a' + 10),
+        b'A'..=b'F' => Some(b - b'A' + 10),
+        _ => None,
+    }
+}
+
+fn hex_decode(s: &str) -> Option<Vec<u8>> {
+    let bytes = s.as_bytes();
+    if bytes.len() % 2 != 0 {
+        return None;
+    }
+    let mut out = Vec::with_capacity(bytes.len() / 2);
+    for pair in bytes.chunks_exact(2) {
+        out.push((hex_value(pair[0])? << 4) | hex_value(pair[1])?);
+    }
+    Some(out)
+}
+
+fn set_member_prefix(key: &str) -> String {
+    format!("{SET_MEMBER_PREFIX}{}:", hex_encode(key.as_bytes()))
+}
+
+fn set_member_key(key: &str, member: &str) -> String {
+    format!(
+        "{}{}",
+        set_member_prefix(key),
+        hex_encode(member.as_bytes())
+    )
+}
+
+fn set_member_upper(prefix: &str) -> Vec<u8> {
+    let mut upper = prefix.as_bytes().to_vec();
+    // Set-member suffixes are hex, so 'g' is the first byte after the suffix
+    // alphabet and makes an exclusive upper bound for this encoded prefix.
+    upper.push(b'g');
+    upper
+}
+
+fn decode_set_member(prefix: &str, key: &[u8]) -> Option<String> {
+    let suffix = key.strip_prefix(prefix.as_bytes())?;
+    let suffix = std::str::from_utf8(suffix).ok()?;
+    String::from_utf8(hex_decode(suffix)?).ok()
+}
+
 /// A transaction wrapper exposing the lock primitives over TiKV.
 ///
 /// Always optimistic. A multi-key mutation calls [`Tx::serialize_handler`] for
@@ -271,10 +391,17 @@ impl Tx {
         // without an explicit commit/rollback — e.g. when a `?` short-circuits a
         // begin, or a future is cancelled — must never crash the daemon.
         let opts = TransactionOptions::new_optimistic().drop_check(CheckLevel::Warn);
-        let txn = client.begin_with_options(opts).await?;
+        let mut txn = client.begin_with_options(opts).await?;
+        let now = match cluster_now_ms(client).await {
+            Ok(now) => now,
+            Err(e) => {
+                let _ = txn.rollback().await;
+                return Err(e);
+            }
+        };
         Ok(Tx {
             txn,
-            now: now_ms(),
+            now,
             serialized: HashSet::new(),
         })
     }
@@ -398,9 +525,10 @@ impl Tx {
 
     // --- set ops (rd / own / idx:wrdesc / idx:rddesc) ---
 
-    /// Load the *live* members of a set (expired members filtered out). Returns
-    /// `None` when the key is absent or has no live members.
-    async fn load_set(&mut self, key: &str) -> anyhow::Result<Option<BTreeMap<String, u64>>> {
+    async fn load_legacy_set(
+        &mut self,
+        key: &str,
+    ) -> anyhow::Result<Option<BTreeMap<String, u64>>> {
         match self.raw_get(key).await? {
             Some(Stored::Set { m }) => {
                 let now = self.now;
@@ -417,27 +545,124 @@ impl Tx {
         }
     }
 
+    async fn scan_set_members(&mut self, key: &str) -> anyhow::Result<BTreeMap<String, u64>> {
+        let prefix = set_member_prefix(key);
+        let upper = set_member_upper(&prefix);
+        let mut cursor = prefix.as_bytes().to_vec();
+        let mut live = BTreeMap::new();
+
+        loop {
+            let pairs: Vec<tikv_client::KvPair> = self
+                .txn
+                .scan(
+                    Key::from(cursor.clone())..Key::from(upper.clone()),
+                    SET_SCAN_PAGE,
+                )
+                .await?
+                .collect();
+            if pairs.is_empty() {
+                break;
+            }
+
+            let got = pairs.len();
+            let mut last_key = Vec::new();
+            for pair in pairs {
+                let kb: Vec<u8> = pair.key().clone().into();
+                last_key = kb.clone();
+                let Some(member) = decode_set_member(&prefix, &kb) else {
+                    continue;
+                };
+                match decode(pair.value())? {
+                    Stored::Str { exp, .. } if !expired(exp, self.now) => {
+                        live.insert(member, exp);
+                    }
+                    Stored::Str { .. } => {}
+                    other => anyhow::bail!(
+                        "set member key {:?} has type {}, expected string",
+                        String::from_utf8_lossy(&kb),
+                        other.kind()
+                    ),
+                }
+            }
+
+            if got < SET_SCAN_PAGE as usize {
+                break;
+            }
+            cursor = last_key;
+            cursor.push(0);
+        }
+
+        Ok(live)
+    }
+
+    async fn migrate_legacy_set(&mut self, key: &str) -> anyhow::Result<()> {
+        let legacy = match self.raw_get(key).await? {
+            Some(Stored::Set { m }) => m,
+            None => return Ok(()),
+            Some(other) => anyhow::bail!("key {key} has type {}, expected set", other.kind()),
+        };
+
+        for (member, exp) in legacy {
+            if !expired(exp, self.now) {
+                let mk = set_member_key(key, &member);
+                self.raw_put(
+                    &mk,
+                    &Stored::Str {
+                        v: "1".to_string(),
+                        exp,
+                    },
+                )
+                .await?;
+            }
+        }
+        self.del(key).await?;
+        Ok(())
+    }
+
+    /// Load the *live* members of a set (expired members filtered out). Returns
+    /// `None` when the key is absent or has no live members.
+    async fn load_set(&mut self, key: &str) -> anyhow::Result<Option<BTreeMap<String, u64>>> {
+        let mut live = self.scan_set_members(key).await?;
+        if let Some(legacy) = self.load_legacy_set(key).await? {
+            for (member, exp) in legacy {
+                let merged = merge_exp(live.get(&member).copied(), exp);
+                live.insert(member, merged);
+            }
+        }
+        if live.is_empty() {
+            Ok(None)
+        } else {
+            Ok(Some(live))
+        }
+    }
+
     /// `SADD key member PX ttl`. Each member carries its own absolute expiry;
     /// re-adding is extend-only (never shortens). Rewriting also drops any
     /// already-expired members, bounding set growth.
     pub async fn sadd(&mut self, key: &str, member: &str, ttl_ms: u64) -> anyhow::Result<()> {
-        let mut m = self.load_set(key).await?.unwrap_or_default();
+        self.migrate_legacy_set(key).await?;
+        let mk = set_member_key(key, member);
         let new = expiry_at(self.now, ttl_ms);
-        let merged = merge_exp(m.get(member).copied(), new);
-        m.insert(member.to_string(), merged);
-        self.raw_put(key, &Stored::Set { m }).await
+        let existing = match self.raw_get(&mk).await? {
+            Some(Stored::Str { exp, .. }) if !expired(exp, self.now) => Some(exp),
+            Some(Stored::Str { .. }) | None => None,
+            Some(other) => anyhow::bail!("key {mk} has type {}, expected string", other.kind()),
+        };
+        let exp = merge_exp(existing, new);
+        self.raw_put(
+            &mk,
+            &Stored::Str {
+                v: "1".to_string(),
+                exp,
+            },
+        )
+        .await
     }
 
-    /// `SREM key member` then `DEL key` when it becomes empty.
+    /// `SREM key member`.
     pub async fn srem(&mut self, key: &str, member: &str) -> anyhow::Result<()> {
-        if let Some(mut m) = self.load_set(key).await? {
-            m.remove(member);
-            if m.is_empty() {
-                self.del(key).await?;
-            } else {
-                self.raw_put(key, &Stored::Set { m }).await?;
-            }
-        }
+        self.migrate_legacy_set(key).await?;
+        self.del(&set_member_key(key, member)).await?;
         Ok(())
     }
 
@@ -465,12 +690,19 @@ impl Tx {
     /// only for the owner set, whose members all share that owner's single
     /// lease.
     pub async fn pexpire_set(&mut self, key: &str, ttl_ms: u64) -> anyhow::Result<()> {
-        if let Some(mut m) = self.load_set(key).await? {
-            let exp = expiry_at(self.now, ttl_ms);
-            for v in m.values_mut() {
-                *v = exp;
-            }
-            self.raw_put(key, &Stored::Set { m }).await?;
+        self.migrate_legacy_set(key).await?;
+        let members = self.scan_set_members(key).await?;
+        let exp = expiry_at(self.now, ttl_ms);
+        for member in members.into_keys() {
+            let mk = set_member_key(key, &member);
+            self.raw_put(
+                &mk,
+                &Stored::Str {
+                    v: "1".to_string(),
+                    exp,
+                },
+            )
+            .await?;
         }
         Ok(())
     }
@@ -486,12 +718,8 @@ async fn begin_warn(client: &TransactionClient) -> anyhow::Result<Transaction> {
         .await?)
 }
 
-/// One garbage-collection sweep: paginate the whole `fslock:` keyspace, find
-/// entries whose emulated TTL has elapsed, and delete them under a re-check so a
-/// concurrently-refreshed key is never reclaimed. Purely reclaims storage; lazy
-/// expiry already guarantees correctness, so this is best-effort.
 pub async fn gc_once(client: &TransactionClient, page: u32) -> anyhow::Result<u64> {
-    let now = now_ms();
+    let now = cluster_now_ms(client).await?;
     let mut cursor: Vec<u8> = PREFIX.as_bytes().to_vec();
     let end: Vec<u8> = b"fslock;".to_vec(); // ':' + 1, exclusive upper bound of the prefix
     let mut deleted: u64 = 0;
@@ -500,7 +728,13 @@ pub async fn gc_once(client: &TransactionClient, page: u32) -> anyhow::Result<u6
         let mut scan_txn = begin_warn(client).await?;
         let start = Key::from(cursor.clone());
         let upper = Key::from(end.clone());
-        let pairs: Vec<tikv_client::KvPair> = scan_txn.scan(start..upper, page).await?.collect();
+        let pairs: Vec<tikv_client::KvPair> = match scan_txn.scan(start..upper, page).await {
+            Ok(s) => s.collect(),
+            Err(e) => {
+                let _ = scan_txn.rollback().await;
+                return Err(e.into());
+            }
+        };
         let _ = scan_txn.rollback().await;
 
         if pairs.is_empty() {
@@ -508,8 +742,6 @@ pub async fn gc_once(client: &TransactionClient, page: u32) -> anyhow::Result<u6
         }
         let got = pairs.len();
         let mut last_key: Vec<u8> = Vec::new();
-        // Hold only the *current page's* expired keys, not the whole keyspace's:
-        // the sweep stays O(page) in memory no matter how many keys have lapsed.
         let mut candidates: Vec<Vec<u8>> = Vec::new();
         for p in &pairs {
             let kb: Vec<u8> = p.key().clone().into();
@@ -522,33 +754,58 @@ pub async fn gc_once(client: &TransactionClient, page: u32) -> anyhow::Result<u6
         }
 
         // Delete this page's expired keys under a fresh re-check so a key a
-        // concurrent refresh re-wrote is never reclaimed. Best-effort: if our
-        // delete loses the write-write race the chunk is retried next sweep, and
-        // lazy expiry keeps correctness regardless.
+        // concurrent refresh re-wrote is never reclaimed.
         for chunk in candidates.chunks(256) {
-            let recheck = now_ms();
+            let recheck = cluster_now_ms(client).await?;
             let mut txn = begin_warn(client).await?;
             let mut chunk_deleted: u64 = 0;
+            let mut chunk_failed = false;
+
             for kb in chunk {
-                if let Some(v) = txn.get(kb.clone()).await? {
-                    if let Ok(s) = decode(&v) {
-                        if expired(s.exp(), recheck) {
-                            txn.delete(kb.clone()).await?;
-                            chunk_deleted += 1;
+                // Catch errors on individual keys instead of short-circuiting with `?`
+                match txn.get(kb.clone()).await {
+                    Ok(Some(v)) => {
+                        if let Ok(s) = decode(&v) {
+                            if expired(s.exp(), recheck) {
+                                if let Err(e) = txn.delete(kb.clone()).await {
+                                    tracing::warn!(error = %e, "gc delete failed, skipping chunk");
+                                    chunk_failed = true;
+                                    break;
+                                }
+                                chunk_deleted += 1;
+                            }
                         }
+                    }
+                    Ok(None) => {}
+                    Err(e) => {
+                        // Log unresolvable locks (like TxnNotFound) as debug info
+                        // and skip this specific key so it doesn't crash the entire sweep.
+                        tracing::debug!(error = %e, "gc skipped unresolvable key lock");
                     }
                 }
             }
-            if txn.commit().await.is_ok() {
-                deleted += chunk_deleted;
+
+            if chunk_failed {
+                let _ = txn.rollback().await;
+                continue;
+            }
+
+            if chunk_deleted > 0 {
+                if txn.commit().await.is_ok() {
+                    deleted += chunk_deleted;
+                } else {
+                    // Explicitly roll back if commit fails to appease the client drop checker
+                    let _ = txn.rollback().await;
+                }
+            } else {
+                // Explicitly clean up empty transactions
+                let _ = txn.rollback().await;
             }
         }
 
         if got < page as usize {
             break;
         }
-        // Advance the cursor past the last key seen (exclusive lower bound). The
-        // keys just deleted sit behind it, so the next page never re-scans them.
         cursor = last_key;
         cursor.push(0);
     }

@@ -1,21 +1,34 @@
 //! Event fan-out for the per-owner lifecycle stream (release / kill / revoke).
 //!
-//! Within a single instance, events go onto a tokio broadcast channel; each
-//! `Subscribe` stream filters it down to its own owner id. Across instances, an
-//! event is best-effort forwarded to configured peers' `PublishEvent` RPC so an
-//! event raised on instance A reaches the owner's subscription on instance B.
-//! The client-side recheck timer is the correctness backstop, so a dropped peer
-//! message only costs latency, never safety.
+//! Within a single instance, each `Subscribe` stream registers a bounded mpsc
+//! sender in a per-owner registry keyed by owner id, and an event is routed only
+//! to the senders registered for *its* owner. Routing is one map lookup, so an
+//! event reaches just the handful of streams that asked for that owner — cost
+//! scales with that owner's subscribers, not the instance-wide subscriber count.
+//! This replaces a single global broadcast channel, where every subscription
+//! woke for every event instance-wide only to discard the ones addressed to
+//! other owners (O(subscribers × events) wakeups, and slow subscribers lagging
+//! the shared ring).
+//!
+//! Across instances, an event is best-effort forwarded to configured peers'
+//! `PublishEvent` RPC so an event raised on instance A reaches the owner's
+//! subscription on instance B. The client-side recheck timer is the correctness
+//! backstop, so a dropped peer message only costs latency, never safety.
 //!
 //! Peer fan-out uses one long-lived forwarder task per peer draining a bounded
 //! queue (not a task per event), so a slow or dead peer can neither pile up
 //! tasks nor stall the request path: a full queue simply drops the event, and
 //! each forward RPC carries a timeout.
 
-use std::sync::Arc;
+use std::collections::HashMap;
+use std::pin::Pin;
+use std::sync::atomic::{AtomicU64, Ordering};
+use std::sync::{Arc, Mutex};
+use std::task::{Context, Poll};
 use std::time::Duration;
 
-use tokio::sync::{broadcast, mpsc};
+use futures::Stream;
+use tokio::sync::mpsc;
 use tonic::transport::{Channel, Endpoint};
 
 use crate::proto::{path_lock_client::PathLockClient, Event, EventType, PublishEventRequest};
@@ -32,13 +45,109 @@ pub struct Broadcaster {
 }
 
 struct Inner {
-    tx: broadcast::Sender<Event>,
+    registry: Arc<Registry>,
     peer_txs: Vec<mpsc::Sender<Event>>,
+}
+
+/// Live subscriptions keyed by owner id. An event is delivered by looking up its
+/// owner and pushing to that owner's senders only, so delivery cost scales with
+/// the subscribers for *that* owner, not the instance-wide subscriber count.
+struct Registry {
+    subs: Mutex<HashMap<String, Vec<SubSender>>>,
+    next_id: AtomicU64,
+    /// Per-subscriber queue depth. A subscriber only ever queues its own owner's
+    /// events, so this fills only if that one client stalls; an overflow drops
+    /// (the client recheck is the correctness backstop). tokio's bounded mpsc
+    /// allocates on demand, so a large depth costs memory only when backlogged.
+    capacity: usize,
+}
+
+/// One subscriber's sender plus the id used to remove exactly it on drop (an
+/// owner may hold more than one subscription).
+struct SubSender {
+    id: u64,
+    tx: mpsc::Sender<Event>,
+}
+
+impl Registry {
+    fn new(capacity: usize) -> Arc<Self> {
+        Arc::new(Self {
+            subs: Mutex::new(HashMap::new()),
+            next_id: AtomicU64::new(0),
+            capacity: capacity.max(1),
+        })
+    }
+
+    /// Deliver `ev` to the live subscribers for its owner, if any.
+    fn route(&self, ev: &Event) {
+        let subs = self.subs.lock().expect("event registry mutex poisoned");
+        if let Some(list) = subs.get(&ev.owner_id) {
+            for s in list {
+                // Non-blocking: never stall the publish path. A full or closed
+                // queue drops the event; closed senders are reaped by the owning
+                // Subscription's Drop, not here.
+                let _ = s.tx.try_send(ev.clone());
+            }
+        }
+    }
+
+    /// Register a new subscription for `owner` and hand back its stream.
+    fn register(self: &Arc<Self>, owner: &str) -> Subscription {
+        let (tx, rx) = mpsc::channel(self.capacity);
+        let id = self.next_id.fetch_add(1, Ordering::Relaxed);
+        self.subs
+            .lock()
+            .expect("event registry mutex poisoned")
+            .entry(owner.to_string())
+            .or_default()
+            .push(SubSender { id, tx });
+        Subscription {
+            rx,
+            registry: Arc::clone(self),
+            owner: owner.to_string(),
+            id,
+        }
+    }
+
+    /// Drop one subscription's sender (from `Subscription::drop`), and the owner
+    /// entry entirely once its last subscriber leaves, so the map cannot grow
+    /// without bound as clients come and go.
+    fn unregister(&self, owner: &str, id: u64) {
+        let mut subs = self.subs.lock().expect("event registry mutex poisoned");
+        if let Some(list) = subs.get_mut(owner) {
+            list.retain(|s| s.id != id);
+            if list.is_empty() {
+                subs.remove(owner);
+            }
+        }
+    }
+}
+
+/// A live per-owner event subscription. Yields the owner's `Event`s; on drop it
+/// unregisters itself so a disconnected client leaves no dangling sender behind.
+pub struct Subscription {
+    rx: mpsc::Receiver<Event>,
+    registry: Arc<Registry>,
+    owner: String,
+    id: u64,
+}
+
+impl Stream for Subscription {
+    type Item = Event;
+    fn poll_next(self: Pin<&mut Self>, cx: &mut Context<'_>) -> Poll<Option<Self::Item>> {
+        // Subscription is Unpin (every field is), so poll the receiver directly.
+        self.get_mut().rx.poll_recv(cx)
+    }
+}
+
+impl Drop for Subscription {
+    fn drop(&mut self) {
+        self.registry.unregister(&self.owner, self.id);
+    }
 }
 
 impl Broadcaster {
     pub fn new(capacity: usize, peer_endpoints: &[String]) -> anyhow::Result<Self> {
-        let (tx, _rx) = broadcast::channel(capacity.max(16));
         let mut peer_txs = Vec::new();
         for ep in peer_endpoints {
             let endpoint = Endpoint::from_shared(ep.clone())
@@ -51,19 +160,23 @@ impl Broadcaster {
             peer_txs.push(ptx);
         }
         Ok(Self {
-            inner: Arc::new(Inner { tx, peer_txs }),
+            inner: Arc::new(Inner {
+                registry: Registry::new(capacity),
+                peer_txs,
+            }),
         })
     }
 
-    pub fn subscribe(&self) -> broadcast::Receiver<Event> {
-        self.inner.tx.subscribe()
+    /// Register a `Subscribe` stream for `owner`; it receives only that owner's
+    /// events.
+    pub fn subscribe(&self, owner: &str) -> Subscription {
+        self.inner.registry.register(owner)
     }
 
     /// Publish an event that originated on this instance: deliver locally and
     /// enqueue to each peer's forwarder (best-effort, non-blocking).
     pub fn publish_local(&self, ev: Event) {
-        // Local subscribers (ignore "no receivers").
-        let _ = self.inner.tx.send(ev.clone());
+        self.inner.registry.route(&ev);
         for ptx in &self.inner.peer_txs {
             // try_send: if a peer's queue is full we drop rather than block the
             // request path; the client recheck timer is the correctness backstop.
@@ -74,7 +187,7 @@ impl Broadcaster {
     /// Publish an event forwarded from a peer: deliver locally only (do not
     /// re-forward, which would loop).
     pub fn publish_from_peer(&self, ev: Event) {
-        let _ = self.inner.tx.send(ev);
+        self.inner.registry.route(&ev);
     }
 
     pub fn released(&self, owner: &str) {

@@ -13,6 +13,8 @@
 //! gc_interval_secs = 60
 //! gc_page          = 256
 //! event_buffer     = 8192
+//! request_timeout_ms = 30000
+//! max_concurrent_requests_per_connection = 256
 //! enable_debug     = false
 //! log_level        = "info"
 //! ```
@@ -32,10 +34,16 @@ pub struct Config {
     pub gc_interval_secs: u64,
     /// Keys scanned per GC page.
     pub gc_page: u32,
-    /// Capacity of the in-process event broadcast channel.
+    /// Per-subscriber event queue depth. Each `Subscribe` stream gets its own
+    /// bounded queue of this size carrying only its owner's events; an overflow
+    /// drops (the client recheck is the backstop).
     pub event_buffer: usize,
     /// Peer pathlockd endpoints for cross-instance event fan-out (optional).
     pub peers: Vec<String>,
+    /// Server-side deadline applied to each unary/stream setup RPC.
+    pub request_timeout_ms: u64,
+    /// Per-HTTP/2-connection request concurrency limit.
+    pub max_concurrent_requests_per_connection: usize,
     /// Enable the PathLockDebug service (test fault injection). Keep false in prod.
     pub enable_debug: bool,
     /// tracing-subscriber log filter (e.g. "info", "pathlockd=debug").
@@ -47,10 +55,12 @@ impl Default for Config {
         Config {
             listen: "0.0.0.0:50051".to_string(),
             pd_endpoints: vec!["127.0.0.1:2379".to_string()],
-            gc_interval_secs: 1,
+            gc_interval_secs: 60,
             gc_page: 1024,
             event_buffer: 8192,
             peers: Vec::new(),
+            request_timeout_ms: 30_000,
+            max_concurrent_requests_per_connection: 256,
             enable_debug: false,
             log_level: "info".to_string(),
         }
@@ -66,6 +76,8 @@ struct FileConfig {
     gc_page: Option<u32>,
     event_buffer: Option<usize>,
     peers: Option<Vec<String>>,
+    request_timeout_ms: Option<u64>,
+    max_concurrent_requests_per_connection: Option<usize>,
     enable_debug: Option<bool>,
     log_level: Option<String>,
 }
@@ -121,6 +133,12 @@ impl Config {
             if let Some(v) = file.peers {
                 cfg.peers = v;
             }
+            if let Some(v) = file.request_timeout_ms {
+                cfg.request_timeout_ms = v;
+            }
+            if let Some(v) = file.max_concurrent_requests_per_connection {
+                cfg.max_concurrent_requests_per_connection = v;
+            }
             if let Some(v) = file.enable_debug {
                 cfg.enable_debug = v;
             }
@@ -148,6 +166,12 @@ impl Config {
         if let Some(v) = env_list("PATHLOCKD_PEERS") {
             cfg.peers = v;
         }
+        if let Some(v) = env_parse::<u64>("PATHLOCKD_REQUEST_TIMEOUT_MS")? {
+            cfg.request_timeout_ms = v;
+        }
+        if let Some(v) = env_parse::<usize>("PATHLOCKD_MAX_CONCURRENT_REQUESTS_PER_CONNECTION")? {
+            cfg.max_concurrent_requests_per_connection = v;
+        }
         if let Some(v) = env_bool("PATHLOCKD_ENABLE_DEBUG")? {
             cfg.enable_debug = v;
         }
@@ -163,6 +187,12 @@ impl Config {
         // (which keeps lazy expiry); fail fast on the footgun instead.
         if cfg.gc_interval_secs > 0 && cfg.gc_page == 0 {
             anyhow::bail!("gc_page must be > 0 when gc is enabled (gc_interval_secs > 0)");
+        }
+        if cfg.request_timeout_ms == 0 {
+            anyhow::bail!("request_timeout_ms must be > 0");
+        }
+        if cfg.max_concurrent_requests_per_connection == 0 {
+            anyhow::bail!("max_concurrent_requests_per_connection must be > 0");
         }
         Ok(cfg)
     }

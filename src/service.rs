@@ -8,7 +8,6 @@ use std::sync::Arc;
 use futures::Stream;
 use futures::StreamExt;
 use tikv_client::TransactionClient;
-use tokio_stream::wrappers::BroadcastStream;
 use tonic::{Request, Response, Status};
 
 use crate::engine::{
@@ -57,9 +56,18 @@ const MAX_TTL_MS: u64 = 7 * 86_400_000; // 7 days
 const MAX_ID_LEN: usize = 1024;
 const MAX_PATH_LEN: usize = 4096;
 const MAX_PATHS_PER_REQUEST: usize = 1024;
+/// A preemption claim is just a short bridge from revoke publication to winner
+/// acquire. Keep the upper bound tight so a bad caller cannot reserve a subtree
+/// for a whole lease window.
+const MAX_CLAIM_TTL_MS: u64 = 60_000;
 /// Hard cap on a deadlock-detection walk so a client can't request an unbounded
-/// scan; `DetectCycle.max_depth` is clamped to this rather than rejected.
-const MAX_CYCLE_DEPTH: u32 = 4096;
+/// scan. Each step is several sequential TiKV round-trips inside one advisory
+/// transaction, so a high cap would let a single request pin a worker and age
+/// its snapshot for seconds while real wait-chains are short. Hitting the cap
+/// returns `Truncated` and the client's recheck simply re-walks, so this bounds
+/// one pass without affecting correctness. `DetectCycle.max_depth` is clamped to
+/// this rather than rejected.
+const MAX_CYCLE_DEPTH: u32 = 64;
 
 #[allow(clippy::result_large_err)]
 fn check_id(label: &str, id: &str) -> Result<(), Status> {
@@ -564,11 +572,27 @@ impl PathLock for PathLockService {
         // and its manager tries to re-acquire. A failure here is non-fatal: the
         // revoke itself (plus client-side backoff) still resolves the deadlock,
         // just without the extra race protection.
-        if !req.claim_path.is_empty() && !req.claimant_owner_id.is_empty() {
+        let wants_claim = !req.claim_path.is_empty() || !req.claimant_owner_id.is_empty();
+        if wants_claim {
+            if req.claim_path.is_empty() || req.claimant_owner_id.is_empty() {
+                return Err(Status::invalid_argument(
+                    "claim_path and claimant_owner_id must be provided together",
+                ));
+            }
+            check_path(&req.claim_path)?;
             check_id("claimant_owner_id", &req.claimant_owner_id)?;
-            if let Err(e) =
-                engine::set_claim(&self.client, &req.claim_path, &req.claimant_owner_id, req.claim_ttl_ms)
-                    .await
+            if req.claim_ttl_ms > MAX_CLAIM_TTL_MS {
+                return Err(Status::invalid_argument(format!(
+                    "claim_ttl_ms too large (max {MAX_CLAIM_TTL_MS} ms; use 0 for the default)"
+                )));
+            }
+            if let Err(e) = engine::set_claim(
+                &self.client,
+                &req.claim_path,
+                &req.claimant_owner_id,
+                req.claim_ttl_ms,
+            )
+            .await
             {
                 tracing::warn!(
                     owner_id = %req.owner_id,
@@ -590,22 +614,11 @@ impl PathLock for PathLockService {
         request: Request<SubscribeRequest>,
     ) -> Result<Response<Self::SubscribeStream>, Status> {
         // A subscription is bound to one owner id and receives only that owner's
-        // events — a lock's channel carries only that lock's information.
+        // events — the registry routes by owner id, so this stream is woken only
+        // for its own events, never the whole instance's traffic.
         let owner = request.into_inner().owner_id;
         check_id("owner_id", &owner)?;
-        let rx = self.broadcaster.subscribe();
-        let stream = BroadcastStream::new(rx).filter_map(move |item| {
-            let owner = owner.clone();
-            async move {
-                match item {
-                    Ok(ev) if ev.owner_id == owner => Some(Ok(ev)),
-                    Ok(_) => None, // event for a different owner — never delivered here
-                    // A lagged subscriber simply missed some events; the client's
-                    // recheck poll is the backstop, so drop the lag marker.
-                    Err(_lagged) => None,
-                }
-            }
-        });
+        let stream = self.broadcaster.subscribe(&owner).map(Ok::<Event, Status>);
         Ok(Response::new(Box::pin(stream)))
     }
 

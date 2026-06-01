@@ -34,6 +34,8 @@ async fn main() -> anyhow::Result<()> {
         listen = %cfg.listen,
         pd_endpoints = ?cfg.pd_endpoints,
         peers = ?cfg.peers,
+        request_timeout_ms = cfg.request_timeout_ms,
+        max_concurrent_requests_per_connection = cfg.max_concurrent_requests_per_connection,
         debug = cfg.enable_debug,
         "starting pathlockd"
     );
@@ -73,7 +75,11 @@ async fn main() -> anyhow::Result<()> {
 
     // Only mount the debug service when explicitly enabled, so its
     // fault-injection surface does not exist at all in production.
-    let mut router = Server::builder().add_service(PathLockServer::new(path_lock));
+    let mut router = Server::builder()
+        .timeout(Duration::from_millis(cfg.request_timeout_ms))
+        .concurrency_limit_per_connection(cfg.max_concurrent_requests_per_connection)
+        .load_shed(true)
+        .add_service(PathLockServer::new(path_lock));
     if cfg.enable_debug {
         warn!("PathLockDebug service ENABLED (fault injection) — never do this in production");
         let debug = DebugService::new(client.clone(), true);
