@@ -283,6 +283,7 @@ fn tikv_error_retryable(e: &tikv_client::Error) -> bool {
                 || k.deadlock.is_some()
                 || k.commit_ts_expired.is_some()
                 || k.commit_ts_too_large.is_some()
+                || k.txn_not_found.is_some()
         }
         Error::PessimisticLockError { inner, .. } => tikv_error_retryable(inner),
         Error::KvError { message } => {
