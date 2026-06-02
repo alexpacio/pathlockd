@@ -236,7 +236,7 @@ fn assert_fencing_ok_and_stale_owner() {
             AssertOutcome::Ok
         );
 
-        engine::debug_set_write_owner(c, &rp("/ancestor"), "different-owner")
+        engine::inject_write_owner(c, &rp("/ancestor"), "different-owner")
             .await
             .unwrap();
         match engine::assert_fencing(c, "own", 7, &[rp("/ancestor")])
@@ -253,7 +253,7 @@ fn assert_fencing_ok_and_stale_owner() {
 fn acquire_detects_stale_fencing_token() {
     run(async {
         let c = fresh().await;
-        engine::debug_set_fence(c, &rp("/fence/stale"), 5)
+        engine::inject_fence(c, &rp("/fence/stale"), 5)
             .await
             .unwrap();
         match acq(c, "cand", vec![w("/fence/stale", State::New)], 3).await {
@@ -274,7 +274,7 @@ fn held_write_missing_returns_lost() {
             acq(c, "o", vec![w("/lost", State::New)], 1).await,
             AcquireOutcome::Ok
         );
-        engine::debug_delete_lock_key(c, &rp("/lost"), Mode::Write, None)
+        engine::inject_deleted_lock_key(c, &rp("/lost"), Mode::Write, None)
             .await
             .unwrap();
         match acq(c, "o", vec![w("/lost", State::Held)], 1).await {
@@ -293,7 +293,7 @@ fn renew_ok_then_lost_when_key_deleted() {
             AcquireOutcome::Ok
         );
         assert_eq!(engine::renew(c, "o", TTL).await.unwrap(), RenewOutcome::Ok);
-        engine::debug_delete_lock_key(c, &rp("/renew"), Mode::Write, None)
+        engine::inject_deleted_lock_key(c, &rp("/renew"), Mode::Write, None)
             .await
             .unwrap();
         match engine::renew(c, "o", TTL).await.unwrap() {
@@ -312,7 +312,7 @@ fn failed_renew_does_not_extend_owner_liveness() {
             AcquireOutcome::Ok
         );
         tokio::time::sleep(std::time::Duration::from_millis(100)).await;
-        engine::debug_delete_lock_key(c, &rp("/renew/lost"), Mode::Write, None)
+        engine::inject_deleted_lock_key(c, &rp("/renew/lost"), Mode::Write, None)
             .await
             .unwrap();
 
@@ -342,7 +342,7 @@ fn prune_dead_read_owners_unblocks_writer() {
             AcquireOutcome::Ok
         );
 
-        engine::debug_expire_owner(c, "stale").await.unwrap();
+        engine::inject_expired_owner(c, "stale").await.unwrap();
         engine::release(
             c,
             "live",
@@ -372,14 +372,16 @@ fn prune_dead_write_owner_unblocks_writer() {
             AcquireOutcome::Ok
         );
 
-        engine::debug_expire_owner(c, "dead-writer").await.unwrap();
+        engine::inject_expired_owner(c, "dead-writer")
+            .await
+            .unwrap();
 
         assert_eq!(
             acq(c, "live-writer", vec![w("/dead-write", State::New)], 2).await,
             AcquireOutcome::Ok
         );
         assert_eq!(
-            engine::debug_get_write_owner(c, &rp("/dead-write"))
+            engine::inspect_write_owner(c, &rp("/dead-write"))
                 .await
                 .unwrap()
                 .as_deref(),
@@ -456,7 +458,7 @@ fn is_blocking_write_and_read() {
         assert!(engine::is_blocking(c, &rp("/b2"), "rd", "read_locked")
             .await
             .unwrap());
-        engine::debug_expire_owner(c, "rd").await.unwrap();
+        engine::inject_expired_owner(c, "rd").await.unwrap();
         assert!(!engine::is_blocking(c, &rp("/b2"), "rd", "read_locked")
             .await
             .unwrap());
@@ -493,18 +495,18 @@ fn inline_release_shadow_transition() {
         assert_eq!(outcome, AcquireOutcome::Ok);
 
         assert_eq!(
-            engine::debug_get_write_owner(c, &rp("/s"))
+            engine::inspect_write_owner(c, &rp("/s"))
                 .await
                 .unwrap()
                 .as_deref(),
             Some("o")
         );
         assert_eq!(
-            engine::debug_get_write_owner(c, &rp("/s/a")).await.unwrap(),
+            engine::inspect_write_owner(c, &rp("/s/a")).await.unwrap(),
             None
         );
         assert_eq!(
-            engine::debug_get_write_owner(c, &rp("/s/b")).await.unwrap(),
+            engine::inspect_write_owner(c, &rp("/s/b")).await.unwrap(),
             None
         );
     });
@@ -651,7 +653,7 @@ fn acquire_reports_lost_for_unlisted_missing_held_lease() {
             acq(c, "O", vec![w("/old", State::New)], 1).await,
             AcquireOutcome::Ok
         );
-        engine::debug_delete_lock_key(c, &rp("/old"), Mode::Write, None)
+        engine::inject_deleted_lock_key(c, &rp("/old"), Mode::Write, None)
             .await
             .unwrap();
 
@@ -753,11 +755,11 @@ fn release_all_clears_everything() {
             AcquireOutcome::Ok
         );
         engine::release_all(c, "o", true).await.unwrap();
-        let (members, alive) = engine::debug_owned_paths(c, "o").await.unwrap();
+        let (members, alive) = engine::inspect_owned_paths(c, "o").await.unwrap();
         assert!(members.is_empty(), "owner set not empty: {members:?}");
         assert!(!alive, "alive key should be gone");
         assert_eq!(
-            engine::debug_get_write_owner(c, &rp("/x")).await.unwrap(),
+            engine::inspect_write_owner(c, &rp("/x")).await.unwrap(),
             None
         );
     });
@@ -904,7 +906,7 @@ fn assert_fencing_detects_stale_token() {
             acq(c, "own", vec![w("/p", State::New)], 4).await,
             AcquireOutcome::Ok
         );
-        engine::debug_set_fence(c, &rp("/p"), 9).await.unwrap();
+        engine::inject_fence(c, &rp("/p"), 9).await.unwrap();
         match engine::assert_fencing(c, "own", 4, &[rp("/p")])
             .await
             .unwrap()
@@ -925,7 +927,7 @@ fn held_write_with_advanced_fence_conflicts() {
             acq(c, "o", vec![w("/p", State::New)], 5).await,
             AcquireOutcome::Ok
         );
-        engine::debug_set_fence(c, &rp("/p"), 11).await.unwrap();
+        engine::inject_fence(c, &rp("/p"), 11).await.unwrap();
         match acq(c, "o", vec![w("/p", State::Held)], 5).await {
             AcquireOutcome::Conflict { reason, owner, .. } => {
                 assert_eq!(reason, "stale_fencing_token");
@@ -951,7 +953,7 @@ fn force_release_unblocks_a_waiter() {
             o => panic!("expected write_locked, got {o:?}"),
         }
         engine::force_release(c, "victim").await.unwrap();
-        let (members, alive) = engine::debug_owned_paths(c, "victim").await.unwrap();
+        let (members, alive) = engine::inspect_owned_paths(c, "victim").await.unwrap();
         assert!(members.is_empty() && !alive, "victim state should be gone");
         assert_eq!(
             acq(c, "other", vec![w("/k", State::New)], 3).await,

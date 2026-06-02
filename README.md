@@ -193,8 +193,7 @@ docker run -d --restart=unless-stopped \
 | `PATHLOCKD_LOG_LEVEL` | `info` | `trace` / `debug` / `info` / `warn` / `error` |
 
 The daemon runs as a non-root user (`uid 10001`) and exposes a liveness
-`HEALTHCHECK` via `--health-check`. Never set `PATHLOCKD_ENABLE_DEBUG=true`
-in production.
+`HEALTHCHECK` via `--health-check`.
 
 ## Quick start (development / playground)
 
@@ -243,9 +242,6 @@ stateless pathlockd replicas.
    forwarded; the client-side recheck is always the correctness backstop.
 4. **Clocks.** Lease expiry uses each instance's wall clock — run pathlockd
    replicas with NTP-synced clocks.
-5. **Never enable the debug service in production** (`PATHLOCKD_ENABLE_DEBUG`
-   must stay unset / `false`).
-
 A Docker Swarm example (single-node TiKV + replicated pathlockd) ships as part
 of the downstream deployments; the same shape works on Kubernetes.
 
@@ -265,7 +261,6 @@ A TOML file (`--config pathlockd.toml` or `PATHLOCKD_CONFIG`) overlaid by
 | `mvcc_gc_interval_secs` | `PATHLOCKD_MVCC_GC_INTERVAL_SECS` | `300` | TiKV transactional MVCC GC interval (0 disables) |
 | `mvcc_gc_safe_point_retention_secs` | `PATHLOCKD_MVCC_GC_SAFE_POINT_RETENTION_SECS` | `600` | safepoint lag behind PD time; must be at least 2x request timeout |
 | `event_buffer` | `PATHLOCKD_EVENT_BUFFER` | `8192` | in-process event channel capacity |
-| `enable_debug` | `PATHLOCKD_ENABLE_DEBUG` | `false` | enable the test-only `PathLockDebug` service |
 | `log_level` | `PATHLOCKD_LOG_LEVEL` | `info` | tracing filter |
 
 ### OpenTelemetry

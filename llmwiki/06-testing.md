@@ -81,6 +81,7 @@ grpcurl -plaintext localhost:50051 pathlockd.v1.PathLock/Health
 - New behaviour → add an engine test asserting the outcome value (OK / CONFLICT
   reason / LOST reason), not internal keys, so tests stay decoupled from the
   byte layout.
-- The `PathLockDebug` service (enable with `PATHLOCKD_ENABLE_DEBUG=1`) is the
-  supported way to inject faults from a test: flush, expire an owner, drop a
-  key, plant a stale fence/owner, read raw state.
+- Engine integration tests use internal `engine::inject_*` and
+  `engine::inspect_*` helpers for fault injection: expire an owner, drop a key,
+  plant a stale fence/owner, and read raw state. These helpers are not exposed
+  over gRPC.

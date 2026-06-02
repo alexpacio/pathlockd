@@ -54,7 +54,7 @@ pub const PREFIX: &str = "fslock:";
 /// matter.
 pub const SERIALIZE_PREFIX: &str = "pathlockd:__serialize__:";
 const GC_LEASE_PREFIX: &str = "pathlockd:gc:";
-/// Debug fencing-token counter key. Public token issuance uses PD TSO.
+/// Test-support fencing-token counter key. Public token issuance uses PD TSO.
 pub const FENCING_COUNTER_KEY: &str = "fslock:fencing:counter";
 
 /// Fence keys live far longer than lock keys so a stale token is still
@@ -195,8 +195,9 @@ pub fn expiry_at(now: u64, ttl_ms: u64) -> u64 {
     }
 }
 
-fn encode(s: &Stored) -> Vec<u8> {
-    bincode::serde::encode_to_vec(s, bincode::config::standard()).expect("bincode serialize Stored")
+fn encode(s: &Stored) -> anyhow::Result<Vec<u8>> {
+    bincode::serde::encode_to_vec(s, bincode::config::standard())
+        .map_err(|e| anyhow::anyhow!("serializing stored value: {e}"))
 }
 
 fn decode(b: &[u8]) -> anyhow::Result<Stored> {
@@ -424,7 +425,7 @@ impl Tx {
     }
 
     async fn raw_put(&mut self, key: &str, v: &Stored) -> anyhow::Result<()> {
-        self.txn.put(key.as_bytes().to_vec(), encode(v)).await?;
+        self.txn.put(key.as_bytes().to_vec(), encode(v)?).await?;
         Ok(())
     }
 
@@ -683,6 +684,15 @@ async fn begin_warn(client: &TransactionClient) -> anyhow::Result<Transaction> {
         .await?)
 }
 
+/// Readiness check used by the Health RPC. Uses the same non-panicking drop
+/// check as normal storage transactions, so a rollback failure reports
+/// unhealthy instead of risking a transaction-drop panic.
+pub async fn check_storage_ready(client: &TransactionClient) -> anyhow::Result<()> {
+    let mut txn = begin_warn(client).await?;
+    txn.rollback().await?;
+    Ok(())
+}
+
 async fn gc_retry_or_fail(
     err: anyhow::Error,
     attempt: &mut u32,
@@ -814,6 +824,10 @@ async fn gc_delete_chunk(client: &TransactionClient, chunk: &[Vec<u8>]) -> anyho
 }
 
 pub async fn gc_once(client: &TransactionClient, page: u32) -> anyhow::Result<u64> {
+    if page == 0 {
+        anyhow::bail!("gc page must be > 0");
+    }
+
     let now = cluster_now_ms(client).await?;
     let mut cursor: Vec<u8> = PREFIX.as_bytes().to_vec();
     let end: Vec<u8> = b"fslock;".to_vec(); // ':' + 1, exclusive upper bound of the prefix
@@ -997,7 +1011,7 @@ async fn flush_fallback_destroy(
     Ok(deleted)
 }
 
-/// Delete every `fslock:` key (used by the debug `Flush` RPC for test isolation).
+/// Delete every `fslock:` key (used by tests for cluster isolation).
 pub async fn flush_all(client: &TransactionClient) -> anyhow::Result<u64> {
     let mut cursor: Vec<u8> = PREFIX.as_bytes().to_vec();
     let end: Vec<u8> = b"fslock;".to_vec();
@@ -1029,6 +1043,67 @@ pub async fn flush_all(client: &TransactionClient) -> anyhow::Result<u64> {
         cursor.push(0);
     }
     Ok(deleted)
+}
+
+/// A census of live `fslock:` keys, split by lifetime class.
+///
+/// Used by the e2e suite to prove the cluster does not accumulate leaked
+/// ("poisoned") state over a sustained workload. After every lock has lapsed and
+/// GC has run, a healthy cluster has `transient == 0`; `durable` may stay
+/// non-zero because fence tombstones and the optional debug fencing counter are
+/// long-lived *by design* (a fence's TTL is `max(ttl, 1 day)` so a stale token
+/// is still detectable after the lock itself is gone).
+#[derive(Debug, Clone, Copy, Default, PartialEq, Eq)]
+pub struct KeyCensus {
+    /// Long-lived-by-design keys: per-path fence tombstones (`fslock:fence:*`)
+    /// and the optional debug fencing counter. Not a sign of leaked state.
+    pub durable: u64,
+    /// Transient lock state: write owners, read/owner/descendant-index set
+    /// members, alive, wait and claim keys. Each carries the lease TTL (or a
+    /// shorter claim TTL), so all of it MUST drain to zero on an idle cluster
+    /// once leases lapse and GC sweeps. A non-zero count after a quiescent
+    /// period means state leaked.
+    pub transient: u64,
+}
+
+impl KeyCensus {
+    pub fn total(&self) -> u64 {
+        self.durable + self.transient
+    }
+}
+
+/// Classify every live `fslock:` key into [`KeyCensus`] buckets. Reuses the same
+/// paged, retrying scan as [`count_all`]; the only difference is the per-key
+/// bucketing.
+pub async fn census(client: &TransactionClient) -> anyhow::Result<KeyCensus> {
+    const FENCE_PREFIX: &[u8] = b"fslock:fence:";
+    let counter = FENCING_COUNTER_KEY.as_bytes();
+    let mut cursor: Vec<u8> = PREFIX.as_bytes().to_vec();
+    let end: Vec<u8> = b"fslock;".to_vec();
+    let mut census = KeyCensus::default();
+    loop {
+        let pairs = gc_scan_page(client, &cursor, &end, 512).await?;
+        if pairs.is_empty() {
+            break;
+        }
+        let got = pairs.len();
+        let mut last_key: Vec<u8> = Vec::new();
+        for p in &pairs {
+            let kb: Vec<u8> = p.key().clone().into();
+            if kb.starts_with(FENCE_PREFIX) || kb == counter {
+                census.durable += 1;
+            } else {
+                census.transient += 1;
+            }
+            last_key = kb;
+        }
+        if got < 512 {
+            break;
+        }
+        cursor = last_key;
+        cursor.push(0);
+    }
+    Ok(census)
 }
 
 /// Count visible live keys under the `fslock:` prefix.
@@ -1109,9 +1184,7 @@ mod tests {
         ))));
 
         // Sanity: an otherwise-empty KeyError stays non-retryable.
-        assert!(!tikv_error_retryable(&Error::KeyError(Box::new(
-            ProtoKeyError::default()
-        ))));
+        assert!(!tikv_error_retryable(&Error::KeyError(Box::default())));
     }
 
     #[tokio::test]

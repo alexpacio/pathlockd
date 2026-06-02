@@ -71,6 +71,15 @@ rust_run() {
     -w /src )
   [ -n "$net" ] && run+=( --network "$net" )
   [ -n "${PATHLOCKD_PD_ENDPOINTS:-}" ] && run+=( -e "PATHLOCKD_PD_ENDPOINTS=$PATHLOCKD_PD_ENDPOINTS" )
+  if [ -n "${PATHLOCKD_EXTRA_ENV:-}" ]; then
+    # PATHLOCKD_EXTRA_ENV is an opt-in list of docker-run flags assembled by
+    # higher-level scripts for test-specific env forwarding, e.g.:
+    #   PATHLOCKD_EXTRA_ENV="-e NAME=value -e OTHER=value"
+    # Values used here are simple test knobs without spaces.
+    # shellcheck disable=SC2206
+    local extra_env=( ${PATHLOCKD_EXTRA_ENV} )
+    run+=( "${extra_env[@]}" )
+  fi
   # Allocate a TTY only when attached to one, so colored cargo output works
   # interactively without polluting piped/CI logs.
   [ -t 0 ] && [ -t 1 ] && run+=( -it )

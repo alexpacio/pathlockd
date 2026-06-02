@@ -17,7 +17,6 @@
 //! event_buffer     = 8192
 //! request_timeout_ms = 30000
 //! max_concurrent_requests_per_connection = 256
-//! enable_debug     = false
 //! log_level        = "info"
 //! ```
 
@@ -25,6 +24,9 @@ use std::path::PathBuf;
 
 use clap::Parser;
 use serde::Deserialize;
+
+const MAX_GC_PAGE: u32 = 65_536;
+const MAX_EVENT_BUFFER: usize = 1_000_000;
 
 #[derive(Debug, Clone)]
 pub struct Config {
@@ -51,8 +53,6 @@ pub struct Config {
     pub request_timeout_ms: u64,
     /// Per-HTTP/2-connection request concurrency limit.
     pub max_concurrent_requests_per_connection: usize,
-    /// Enable the PathLockDebug service (test fault injection). Keep false in prod.
-    pub enable_debug: bool,
     /// tracing-subscriber log filter (e.g. "info", "pathlockd=debug").
     pub log_level: String,
 }
@@ -70,7 +70,6 @@ impl Default for Config {
             peers: Vec::new(),
             request_timeout_ms: 30_000,
             max_concurrent_requests_per_connection: 256,
-            enable_debug: false,
             log_level: "info".to_string(),
         }
     }
@@ -89,7 +88,6 @@ struct FileConfig {
     peers: Option<Vec<String>>,
     request_timeout_ms: Option<u64>,
     max_concurrent_requests_per_connection: Option<usize>,
-    enable_debug: Option<bool>,
     log_level: Option<String>,
 }
 
@@ -156,9 +154,6 @@ impl Config {
             if let Some(v) = file.max_concurrent_requests_per_connection {
                 cfg.max_concurrent_requests_per_connection = v;
             }
-            if let Some(v) = file.enable_debug {
-                cfg.enable_debug = v;
-            }
             if let Some(v) = file.log_level {
                 cfg.log_level = v;
             }
@@ -195,9 +190,6 @@ impl Config {
         if let Some(v) = env_parse::<usize>("PATHLOCKD_MAX_CONCURRENT_REQUESTS_PER_CONNECTION")? {
             cfg.max_concurrent_requests_per_connection = v;
         }
-        if let Some(v) = env_bool("PATHLOCKD_ENABLE_DEBUG")? {
-            cfg.enable_debug = v;
-        }
         if let Some(v) = env_string("PATHLOCKD_LOG_LEVEL") {
             cfg.log_level = v;
         }
@@ -211,11 +203,20 @@ impl Config {
         if cfg.max_concurrent_requests_per_connection == 0 {
             anyhow::bail!("max_concurrent_requests_per_connection must be > 0");
         }
+        if cfg.event_buffer == 0 {
+            anyhow::bail!("event_buffer must be > 0");
+        }
+        if cfg.event_buffer > MAX_EVENT_BUFFER {
+            anyhow::bail!("event_buffer too large (max {MAX_EVENT_BUFFER})");
+        }
         // A 0 page would make every GC scan return nothing and silently disable
         // active reclamation. Disabling it is a job for gc_interval_secs = 0
         // (which keeps lazy expiry); fail fast on the footgun instead.
         if cfg.gc_interval_secs > 0 && cfg.gc_page == 0 {
             anyhow::bail!("gc_page must be > 0 when gc is enabled (gc_interval_secs > 0)");
+        }
+        if cfg.gc_page > MAX_GC_PAGE {
+            anyhow::bail!("gc_page too large (max {MAX_GC_PAGE})");
         }
         if cfg.mvcc_gc_interval_secs > 0 {
             if cfg.mvcc_gc_safe_point_retention_secs == 0 {
@@ -257,41 +258,5 @@ where
             .parse::<T>()
             .map(Some)
             .map_err(|e| anyhow::anyhow!("invalid {key}={s}: {e}")),
-    }
-}
-
-fn env_bool(key: &str) -> anyhow::Result<Option<bool>> {
-    env_string(key).map(|s| parse_bool_env(key, &s)).transpose()
-}
-
-fn parse_bool_env(key: &str, value: &str) -> anyhow::Result<bool> {
-    match value.trim().to_ascii_lowercase().as_str() {
-        "1" | "true" | "yes" | "on" => Ok(true),
-        "0" | "false" | "no" | "off" => Ok(false),
-        _ => anyhow::bail!("invalid {key}={value}: expected one of 1,true,yes,on,0,false,no,off"),
-    }
-}
-
-#[cfg(test)]
-mod tests {
-    use super::*;
-
-    #[test]
-    fn parse_bool_env_accepts_explicit_values() {
-        assert!(parse_bool_env("X", "1").unwrap());
-        assert!(parse_bool_env("X", "true").unwrap());
-        assert!(parse_bool_env("X", "YES").unwrap());
-        assert!(parse_bool_env("X", " on ").unwrap());
-
-        assert!(!parse_bool_env("X", "0").unwrap());
-        assert!(!parse_bool_env("X", "false").unwrap());
-        assert!(!parse_bool_env("X", "NO").unwrap());
-        assert!(!parse_bool_env("X", " off ").unwrap());
-    }
-
-    #[test]
-    fn parse_bool_env_rejects_ambiguous_values() {
-        let err = parse_bool_env("PATHLOCKD_ENABLE_DEBUG", "definitely").unwrap_err();
-        assert!(err.to_string().contains("PATHLOCKD_ENABLE_DEBUG"));
     }
 }

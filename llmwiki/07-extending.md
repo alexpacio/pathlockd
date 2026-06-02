@@ -57,4 +57,5 @@
   rejects clearly malformed paths (`check_path`: no handler, unrooted, `//`,
   `.`/`..`, trailing slash) as a backstop, but does not canonicalize.
 - Fencing tokens must stay monotonic; never write a lower fence for a path.
-- Keep the `PathLockDebug` surface test-only and gated.
+- Keep fault-injection helpers internal to tests; do not add a gRPC debug
+  surface.

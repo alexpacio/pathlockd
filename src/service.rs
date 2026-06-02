@@ -15,24 +15,16 @@ use crate::engine::{
 };
 use crate::events::Broadcaster;
 use crate::proto::{
-    self, path_lock_debug_server::PathLockDebug, path_lock_server::PathLock, AcquireRequest,
-    AcquireResponse, AcquireStatus, AssertFencingRequest, AssertFencingResponse, AssertStatus,
-    ClearWaitEdgeRequest, ClearWaitEdgeResponse, CycleKind, DebugAck, DeleteLockKeyRequest,
-    DetectCycleRequest, DetectCycleResponse, Event, ExpireOwnerRequest, FlushRequest,
-    FlushResponse, ForceReleaseRequest, ForceReleaseResponse, GetFenceRequest, GetFenceResponse,
-    GetFencingCounterRequest, GetFencingCounterResponse, GetWriteOwnerRequest,
-    GetWriteOwnerResponse, HealthRequest, HealthResponse, IncrFencingTokenRequest,
-    IncrFencingTokenResponse, IsBlockingRequest, IsBlockingResponse, IsOwnerAliveRequest,
-    IsOwnerAliveResponse, OwnedPathsRequest, OwnedPathsResponse, PublishEventRequest,
-    PublishEventResponse, ReleaseAllRequest, ReleaseLocksRequest, ReleaseResponse, RenewRequest,
-    RenewResponse, RenewStatus, RequestRevokeRequest, RequestRevokeResponse, SetFenceRequest,
-    SetFencingCounterRequest, SetWaitEdgeRequest, SetWaitEdgeResponse, SetWriteOwnerRequest,
-    SubscribeRequest,
+    self, path_lock_server::PathLock, AcquireRequest, AcquireResponse, AcquireStatus,
+    AssertFencingRequest, AssertFencingResponse, AssertStatus, ClearWaitEdgeRequest,
+    ClearWaitEdgeResponse, CycleKind, DetectCycleRequest, DetectCycleResponse, Event,
+    ForceReleaseRequest, ForceReleaseResponse, HealthRequest, HealthResponse,
+    IncrFencingTokenRequest, IncrFencingTokenResponse, IsBlockingRequest, IsBlockingResponse,
+    IsOwnerAliveRequest, IsOwnerAliveResponse, PublishEventRequest, PublishEventResponse,
+    ReleaseAllRequest, ReleaseLocksRequest, ReleaseResponse, RenewRequest, RenewResponse,
+    RenewStatus, RequestRevokeRequest, RequestRevokeResponse, SetWaitEdgeRequest,
+    SetWaitEdgeResponse, SubscribeRequest,
 };
-
-fn internal<E: std::fmt::Display>(e: E) -> Status {
-    Status::internal(e.to_string())
-}
 
 /// Map an engine error to a gRPC status. A transient TiKV error that survived
 /// the bounded retry budget becomes `Unavailable` so the client backs off and
@@ -237,7 +229,6 @@ impl PathLockService {
 
 type EventStream = Pin<Box<dyn Stream<Item = Result<Event, Status>> + Send>>;
 const PATH_LOCK_SERVICE: &str = "pathlockd.v1.PathLock";
-const PATH_LOCK_DEBUG_SERVICE: &str = "pathlockd.v1.PathLockDebug";
 
 #[tonic::async_trait]
 impl PathLock for PathLockService {
@@ -767,14 +758,11 @@ impl PathLock for PathLockService {
             request,
             |_request| async move {
                 // Readiness: confirm we can open and close a TiKV transaction.
-                let resp = match self.client.begin_optimistic().await {
-                    Ok(mut txn) => {
-                        let _ = txn.rollback().await;
-                        HealthResponse {
-                            ok: true,
-                            detail: "ready".into(),
-                        }
-                    }
+                let resp = match crate::store::check_storage_ready(&self.client).await {
+                    Ok(()) => HealthResponse {
+                        ok: true,
+                        detail: "ready".into(),
+                    },
                     Err(e) => HealthResponse {
                         ok: false,
                         detail: format!("tikv unreachable: {e}"),
@@ -783,209 +771,6 @@ impl PathLock for PathLockService {
                 Ok(Response::new(resp))
             },
         )
-        .await
-    }
-}
-
-// ---------------------------------------------------------------------------
-// PathLockDebug service
-// ---------------------------------------------------------------------------
-
-pub struct DebugService {
-    pub client: Arc<TransactionClient>,
-    pub enabled: bool,
-}
-
-impl DebugService {
-    pub fn new(client: Arc<TransactionClient>, enabled: bool) -> Self {
-        Self { client, enabled }
-    }
-
-    #[allow(clippy::result_large_err)]
-    fn guard(&self) -> Result<(), Status> {
-        if self.enabled {
-            Ok(())
-        } else {
-            Err(Status::failed_precondition(
-                "debug service disabled (set PATHLOCKD_ENABLE_DEBUG=1)",
-            ))
-        }
-    }
-}
-
-#[tonic::async_trait]
-impl PathLockDebug for DebugService {
-    async fn flush(&self, r: Request<FlushRequest>) -> Result<Response<FlushResponse>, Status> {
-        crate::otel::observe_rpc(PATH_LOCK_DEBUG_SERVICE, "Flush", r, |_r| async move {
-            self.guard()?;
-            let deleted = crate::store::flush_all(&self.client)
-                .await
-                .map_err(internal)?;
-            Ok(Response::new(FlushResponse { deleted }))
-        })
-        .await
-    }
-
-    async fn expire_owner(
-        &self,
-        r: Request<ExpireOwnerRequest>,
-    ) -> Result<Response<DebugAck>, Status> {
-        crate::otel::observe_rpc(PATH_LOCK_DEBUG_SERVICE, "ExpireOwner", r, |r| async move {
-            self.guard()?;
-            engine::debug_expire_owner(&self.client, &r.into_inner().owner_id)
-                .await
-                .map_err(internal)?;
-            Ok(Response::new(DebugAck {}))
-        })
-        .await
-    }
-
-    async fn delete_lock_key(
-        &self,
-        r: Request<DeleteLockKeyRequest>,
-    ) -> Result<Response<DebugAck>, Status> {
-        crate::otel::observe_rpc(
-            PATH_LOCK_DEBUG_SERVICE,
-            "DeleteLockKey",
-            r,
-            |r| async move {
-                self.guard()?;
-                let req = r.into_inner();
-                let owner = if req.owner_id.is_empty() {
-                    None
-                } else {
-                    Some(req.owner_id)
-                };
-                engine::debug_delete_lock_key(&self.client, &req.path, to_mode(req.mode)?, owner)
-                    .await
-                    .map_err(internal)?;
-                Ok(Response::new(DebugAck {}))
-            },
-        )
-        .await
-    }
-
-    async fn set_write_owner(
-        &self,
-        r: Request<SetWriteOwnerRequest>,
-    ) -> Result<Response<DebugAck>, Status> {
-        crate::otel::observe_rpc(
-            PATH_LOCK_DEBUG_SERVICE,
-            "SetWriteOwner",
-            r,
-            |r| async move {
-                self.guard()?;
-                let req = r.into_inner();
-                engine::debug_set_write_owner(&self.client, &req.path, &req.owner_id)
-                    .await
-                    .map_err(internal)?;
-                Ok(Response::new(DebugAck {}))
-            },
-        )
-        .await
-    }
-
-    async fn get_write_owner(
-        &self,
-        r: Request<GetWriteOwnerRequest>,
-    ) -> Result<Response<GetWriteOwnerResponse>, Status> {
-        crate::otel::observe_rpc(
-            PATH_LOCK_DEBUG_SERVICE,
-            "GetWriteOwner",
-            r,
-            |r| async move {
-                self.guard()?;
-                let owner = engine::debug_get_write_owner(&self.client, &r.into_inner().path)
-                    .await
-                    .map_err(internal)?;
-                Ok(Response::new(GetWriteOwnerResponse {
-                    exists: owner.is_some(),
-                    owner_id: owner.unwrap_or_default(),
-                }))
-            },
-        )
-        .await
-    }
-
-    async fn set_fence(&self, r: Request<SetFenceRequest>) -> Result<Response<DebugAck>, Status> {
-        crate::otel::observe_rpc(PATH_LOCK_DEBUG_SERVICE, "SetFence", r, |r| async move {
-            self.guard()?;
-            let req = r.into_inner();
-            engine::debug_set_fence(&self.client, &req.path, req.value)
-                .await
-                .map_err(internal)?;
-            Ok(Response::new(DebugAck {}))
-        })
-        .await
-    }
-
-    async fn get_fence(
-        &self,
-        r: Request<GetFenceRequest>,
-    ) -> Result<Response<GetFenceResponse>, Status> {
-        crate::otel::observe_rpc(PATH_LOCK_DEBUG_SERVICE, "GetFence", r, |r| async move {
-            self.guard()?;
-            let value = engine::debug_get_fence(&self.client, &r.into_inner().path)
-                .await
-                .map_err(internal)?;
-            Ok(Response::new(GetFenceResponse {
-                exists: value.is_some(),
-                value: value.unwrap_or(0),
-            }))
-        })
-        .await
-    }
-
-    async fn set_fencing_counter(
-        &self,
-        r: Request<SetFencingCounterRequest>,
-    ) -> Result<Response<DebugAck>, Status> {
-        crate::otel::observe_rpc(
-            PATH_LOCK_DEBUG_SERVICE,
-            "SetFencingCounter",
-            r,
-            |r| async move {
-                self.guard()?;
-                engine::debug_set_fencing_counter(&self.client, r.into_inner().value)
-                    .await
-                    .map_err(internal)?;
-                Ok(Response::new(DebugAck {}))
-            },
-        )
-        .await
-    }
-
-    async fn get_fencing_counter(
-        &self,
-        r: Request<GetFencingCounterRequest>,
-    ) -> Result<Response<GetFencingCounterResponse>, Status> {
-        crate::otel::observe_rpc(
-            PATH_LOCK_DEBUG_SERVICE,
-            "GetFencingCounter",
-            r,
-            |_r| async move {
-                self.guard()?;
-                let value = engine::debug_get_fencing_counter(&self.client)
-                    .await
-                    .map_err(internal)?;
-                Ok(Response::new(GetFencingCounterResponse { value }))
-            },
-        )
-        .await
-    }
-
-    async fn owned_paths(
-        &self,
-        r: Request<OwnedPathsRequest>,
-    ) -> Result<Response<OwnedPathsResponse>, Status> {
-        crate::otel::observe_rpc(PATH_LOCK_DEBUG_SERVICE, "OwnedPaths", r, |r| async move {
-            self.guard()?;
-            let (members, alive) =
-                engine::debug_owned_paths(&self.client, &r.into_inner().owner_id)
-                    .await
-                    .map_err(internal)?;
-            Ok(Response::new(OwnedPathsResponse { members, alive }))
-        })
         .await
     }
 }

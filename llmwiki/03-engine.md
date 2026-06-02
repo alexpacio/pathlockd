@@ -97,8 +97,8 @@ the predicate a waiter polls to decide when to retry an acquire.
 (the wait-for graph), `is_owner_alive` (liveness probe). These skip the
 serialization key.
 
-## Debug ops (gated)
+## Test-support ops
 
-`debug_*` functions back the `PathLockDebug` service for fault-injection tests:
-flush, expire an owner, drop a lock key, plant a raw write owner / fence, read
-raw state. Never exposed unless `enable_debug` is set.
+`inject_*` and `inspect_*` functions are internal helpers for fault-injection
+tests: expire an owner, drop a lock key, plant a raw write owner / fence, read
+raw state. They are not exposed over gRPC.

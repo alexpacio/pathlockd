@@ -16,11 +16,10 @@ Resolution order, lowest to highest precedence:
 | TiKV MVCC GC interval | `mvcc_gc_interval_secs` | `PATHLOCKD_MVCC_GC_INTERVAL_SECS` | `300` | 0 disables pathlockd-driven TiKV safepoint GC |
 | TiKV MVCC retention | `mvcc_gc_safe_point_retention_secs` | `PATHLOCKD_MVCC_GC_SAFE_POINT_RETENTION_SECS` | `600` | safepoint lag; must be at least 2x request timeout |
 | event buffer | `event_buffer` | `PATHLOCKD_EVENT_BUFFER` | `8192` | in-process broadcast capacity |
-| debug | `enable_debug` | `PATHLOCKD_ENABLE_DEBUG` | `false` | enables `PathLockDebug`; never in prod |
 | log level | `log_level` | `PATHLOCKD_LOG_LEVEL` | `info` | tracing filter |
 
-Env booleans accept `1/true/yes/on`. Env lists are comma-separated. `RUST_LOG`,
-if set, overrides `log_level` (standard `tracing-subscriber` env filter).
+Env lists are comma-separated. `RUST_LOG`, if set, overrides `log_level`
+(standard `tracing-subscriber` env filter).
 
 OpenTelemetry has no TOML fields. `src/otel.rs` enables OTLP traces and metrics
 from standard env vars:
@@ -46,4 +45,3 @@ export stays off and normal tracing logs still initialize.
 - **TiKV MVCC GC** is separate from logical expiry. Keep
   `mvcc_gc_interval_secs` enabled for standalone TiKV; disable it if another
   TiDB/GC coordinator owns the cluster safepoint.
-- **Debug service** must stay disabled in production; it can flush all state.

@@ -1138,13 +1138,13 @@ pub async fn is_owner_alive(client: &TransactionClient, owner: &str) -> anyhow::
 }
 
 // ---------------------------------------------------------------------------
-// Debug ops (gated by PATHLOCKD_ENABLE_DEBUG). These let tests inject fault
-// scenarios — kill an owner, drop a key, plant a stale fence/owner, read raw
-// state — without coupling them to the storage byte layout.
+// Test-support ops. These let integration tests inject fault scenarios — kill an
+// owner, drop a key, plant a stale fence/owner, read raw state — without
+// coupling them to the storage byte layout. They are not exposed over gRPC.
 // ---------------------------------------------------------------------------
 
 /// Simulate a dead owner (drop its alive + owner-set keys).
-pub async fn debug_expire_owner(client: &TransactionClient, owner: &str) -> anyhow::Result<()> {
+pub async fn inject_expired_owner(client: &TransactionClient, owner: &str) -> anyhow::Result<()> {
     txn_retry!(client, tx => {
         async {
             tx.del(&alive_key(owner)).await?;
@@ -1155,7 +1155,7 @@ pub async fn debug_expire_owner(client: &TransactionClient, owner: &str) -> anyh
 }
 
 /// Simulate a lock key vanishing (drop a write key, or a read-set member).
-pub async fn debug_delete_lock_key(
+pub async fn inject_deleted_lock_key(
     client: &TransactionClient,
     path: &str,
     mode: Mode,
@@ -1176,7 +1176,7 @@ pub async fn debug_delete_lock_key(
 }
 
 /// Plant a raw write owner on a path.
-pub async fn debug_set_write_owner(
+pub async fn inject_write_owner(
     client: &TransactionClient,
     path: &str,
     owner: &str,
@@ -1184,7 +1184,7 @@ pub async fn debug_set_write_owner(
     txn_retry!(client, tx => { tx.set_str(&wr_key(path), owner, 0).await })
 }
 
-pub async fn debug_get_write_owner(
+pub async fn inspect_write_owner(
     client: &TransactionClient,
     path: &str,
 ) -> anyhow::Result<Option<String>> {
@@ -1192,7 +1192,7 @@ pub async fn debug_get_write_owner(
 }
 
 /// Plant a fence value on a path.
-pub async fn debug_set_fence(
+pub async fn inject_fence(
     client: &TransactionClient,
     path: &str,
     value: i64,
@@ -1200,26 +1200,20 @@ pub async fn debug_set_fence(
     txn_retry!(client, tx => { tx.set_str(&fence_key(path), &value.to_string(), 0).await })
 }
 
-pub async fn debug_get_fence(
-    client: &TransactionClient,
-    path: &str,
-) -> anyhow::Result<Option<i64>> {
+pub async fn inspect_fence(client: &TransactionClient, path: &str) -> anyhow::Result<Option<i64>> {
     txn_retry!(client, tx => { Ok(parse_fence(tx.get_str(&fence_key(path)).await?)) })
 }
 
-pub async fn debug_set_fencing_counter(
-    client: &TransactionClient,
-    value: i64,
-) -> anyhow::Result<()> {
+pub async fn inject_fencing_counter(client: &TransactionClient, value: i64) -> anyhow::Result<()> {
     txn_retry!(client, tx => { tx.set_counter(FENCING_COUNTER_KEY, value).await })
 }
 
-pub async fn debug_get_fencing_counter(client: &TransactionClient) -> anyhow::Result<i64> {
+pub async fn inspect_fencing_counter(client: &TransactionClient) -> anyhow::Result<i64> {
     txn_retry!(client, tx => { tx.get_counter(FENCING_COUNTER_KEY).await })
 }
 
 /// Owner-set membership plus liveness (read-only inspection).
-pub async fn debug_owned_paths(
+pub async fn inspect_owned_paths(
     client: &TransactionClient,
     owner: &str,
 ) -> anyhow::Result<(Vec<String>, bool)> {

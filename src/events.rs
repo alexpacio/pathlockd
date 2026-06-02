@@ -23,7 +23,7 @@
 use std::collections::HashMap;
 use std::pin::Pin;
 use std::sync::atomic::{AtomicU64, Ordering};
-use std::sync::{Arc, Mutex};
+use std::sync::{Arc, Mutex, MutexGuard};
 use std::task::{Context, Poll};
 use std::time::Duration;
 
@@ -38,6 +38,10 @@ use crate::proto::{path_lock_client::PathLockClient, Event, EventType, PublishEv
 const PEER_QUEUE: usize = 1024;
 /// Timeout applied to each peer `PublishEvent` RPC (connect and per-call).
 const PEER_RPC_TIMEOUT: Duration = Duration::from_secs(5);
+/// Hard cap for each subscriber queue. Tokio's bounded mpsc rejects capacities
+/// above its semaphore limit; keep config inside a sane operational range before
+/// channel construction can panic.
+const MAX_SUBSCRIBER_QUEUE: usize = 1_000_000;
 
 #[derive(Clone)]
 pub struct Broadcaster {
@@ -70,17 +74,30 @@ struct SubSender {
 }
 
 impl Registry {
-    fn new(capacity: usize) -> Arc<Self> {
-        Arc::new(Self {
+    fn new(capacity: usize) -> anyhow::Result<Arc<Self>> {
+        if capacity == 0 {
+            anyhow::bail!("event_buffer must be > 0");
+        }
+        if capacity > MAX_SUBSCRIBER_QUEUE {
+            anyhow::bail!("event_buffer too large (max {MAX_SUBSCRIBER_QUEUE})");
+        }
+        Ok(Arc::new(Self {
             subs: Mutex::new(HashMap::new()),
             next_id: AtomicU64::new(0),
-            capacity: capacity.max(1),
+            capacity,
+        }))
+    }
+
+    fn lock_subs(&self) -> MutexGuard<'_, HashMap<String, Vec<SubSender>>> {
+        self.subs.lock().unwrap_or_else(|poisoned| {
+            tracing::warn!("event registry mutex was poisoned; recovering registry state");
+            poisoned.into_inner()
         })
     }
 
     /// Deliver `ev` to the live subscribers for its owner, if any.
     fn route(&self, ev: &Event) {
-        let subs = self.subs.lock().expect("event registry mutex poisoned");
+        let subs = self.lock_subs();
         if let Some(list) = subs.get(&ev.owner_id) {
             for s in list {
                 // Non-blocking: never stall the publish path. A full or closed
@@ -95,9 +112,7 @@ impl Registry {
     fn register(self: &Arc<Self>, owner: &str) -> Subscription {
         let (tx, rx) = mpsc::channel(self.capacity);
         let id = self.next_id.fetch_add(1, Ordering::Relaxed);
-        self.subs
-            .lock()
-            .expect("event registry mutex poisoned")
+        self.lock_subs()
             .entry(owner.to_string())
             .or_default()
             .push(SubSender { id, tx });
@@ -113,7 +128,7 @@ impl Registry {
     /// entry entirely once its last subscriber leaves, so the map cannot grow
     /// without bound as clients come and go.
     fn unregister(&self, owner: &str, id: u64) {
-        let mut subs = self.subs.lock().expect("event registry mutex poisoned");
+        let mut subs = self.lock_subs();
         if let Some(list) = subs.get_mut(owner) {
             list.retain(|s| s.id != id);
             if list.is_empty() {
@@ -148,6 +163,7 @@ impl Drop for Subscription {
 
 impl Broadcaster {
     pub fn new(capacity: usize, peer_endpoints: &[String]) -> anyhow::Result<Self> {
+        let registry = Registry::new(capacity)?;
         let mut peer_txs = Vec::new();
         for ep in peer_endpoints {
             let endpoint = Endpoint::from_shared(ep.clone())
@@ -160,10 +176,7 @@ impl Broadcaster {
             peer_txs.push(ptx);
         }
         Ok(Self {
-            inner: Arc::new(Inner {
-                registry: Registry::new(capacity),
-                peer_txs,
-            }),
+            inner: Arc::new(Inner { registry, peer_txs }),
         })
     }
 
@@ -219,8 +232,30 @@ impl Broadcaster {
 async fn peer_forwarder(channel: Channel, mut rx: mpsc::Receiver<Event>) {
     let mut client = PathLockClient::new(channel);
     while let Some(ev) = rx.recv().await {
-        let _ = client
+        let owner_id = ev.owner_id.clone();
+        let event_type = ev.r#type;
+        if let Err(e) = client
             .publish_event(PublishEventRequest { event: Some(ev) })
-            .await;
+            .await
+        {
+            tracing::debug!(
+                owner_id = %owner_id,
+                event_type,
+                error = %e,
+                "peer event forward failed"
+            );
+        }
+    }
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+
+    #[test]
+    fn broadcaster_rejects_invalid_subscriber_queue_sizes() {
+        assert!(Broadcaster::new(0, &[]).is_err());
+        assert!(Broadcaster::new(MAX_SUBSCRIBER_QUEUE + 1, &[]).is_err());
+        assert!(Broadcaster::new(1, &[]).is_ok());
     }
 }

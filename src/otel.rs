@@ -66,7 +66,8 @@ impl TelemetryGuard {
 
 pub fn init(log_level: &str) -> anyhow::Result<TelemetryGuard> {
     let filter = tracing_subscriber::EnvFilter::try_from_default_env()
-        .unwrap_or_else(|_| EnvFilter::new(log_level.to_string()));
+        .or_else(|_| EnvFilter::try_new(log_level))
+        .map_err(|e| anyhow::anyhow!("invalid tracing filter {log_level:?}: {e}"))?;
     let fmt_layer = tracing_subscriber::fmt::layer();
 
     if sdk_disabled() {
