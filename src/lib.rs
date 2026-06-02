@@ -20,5 +20,6 @@ mod macros;
 pub mod config;
 pub mod engine;
 pub mod events;
+pub mod otel;
 pub mod service;
 pub mod store;

@@ -1,5 +1,5 @@
 use std::sync::Arc;
-use std::time::Duration;
+use std::time::{Duration, Instant};
 
 use tikv_client::TransactionClient;
 use tonic::transport::{Endpoint, Server};
@@ -12,7 +12,7 @@ use pathlockd::proto::path_lock_debug_server::PathLockDebugServer;
 use pathlockd::proto::path_lock_server::PathLockServer;
 use pathlockd::proto::HealthRequest;
 use pathlockd::service::{DebugService, PathLockService};
-use pathlockd::store;
+use pathlockd::{otel, store};
 
 const HEALTH_PROBE_TIMEOUT: Duration = Duration::from_secs(2);
 
@@ -26,9 +26,7 @@ async fn main() -> anyhow::Result<()> {
         return health_probe(&cfg.listen).await;
     }
 
-    let filter = tracing_subscriber::EnvFilter::try_from_default_env()
-        .unwrap_or_else(|_| tracing_subscriber::EnvFilter::new(cfg.log_level.clone()));
-    tracing_subscriber::fmt().with_env_filter(filter).init();
+    let telemetry = otel::init(&cfg.log_level)?;
 
     info!(
         listen = %cfg.listen,
@@ -37,6 +35,8 @@ async fn main() -> anyhow::Result<()> {
         request_timeout_ms = cfg.request_timeout_ms,
         max_concurrent_requests_per_connection = cfg.max_concurrent_requests_per_connection,
         debug = cfg.enable_debug,
+        otel_traces = telemetry.traces_enabled(),
+        otel_metrics = telemetry.metrics_enabled(),
         "starting pathlockd"
     );
 
@@ -57,10 +57,19 @@ async fn main() -> anyhow::Result<()> {
             tick.tick().await; // consume the immediate first tick
             loop {
                 tick.tick().await;
+                let started = Instant::now();
                 match store::gc_once(&gc_client, page).await {
-                    Ok(n) if n > 0 => info!(reclaimed = n, "gc sweep"),
-                    Ok(_) => {}
-                    Err(e) => error!(error = %e, "gc sweep failed"),
+                    Ok(n) if n > 0 => {
+                        otel::record_gc_sweep(n as u64, started.elapsed(), true);
+                        info!(reclaimed = n, "gc sweep");
+                    }
+                    Ok(_) => {
+                        otel::record_gc_sweep(0, started.elapsed(), true);
+                    }
+                    Err(e) => {
+                        otel::record_gc_sweep(0, started.elapsed(), false);
+                        error!(error = %e, "gc sweep failed");
+                    }
                 }
             }
         });
@@ -87,9 +96,17 @@ async fn main() -> anyhow::Result<()> {
     }
 
     info!(%addr, "pathlockd listening");
-    router.serve_with_shutdown(addr, shutdown_signal()).await?;
+    let serve_result = router.serve_with_shutdown(addr, shutdown_signal()).await;
 
-    info!("pathlockd stopped");
+    match &serve_result {
+        Ok(_) => info!("pathlockd stopped"),
+        Err(e) => error!(error = %e, "pathlockd stopped with server error"),
+    }
+    if let Err(e) = telemetry.shutdown() {
+        warn!(error = %e, "OpenTelemetry shutdown failed");
+    }
+
+    serve_result?;
     Ok(())
 }
 

@@ -126,8 +126,8 @@ pathlockd enforces this containment directly, with O(subtree) conflict checks
 The following are **not yet implemented** and are planned for the final `1.0.0`
 release:
 
-- [ ] **Metrics** — no metrics/observability endpoint yet (e.g. Prometheus:
-  retry/conflict rates, lock counts, transaction latency, GC reclaimed).
+- [ ] **Prometheus scrape endpoint** — OTLP tracing/metrics export is available;
+  a local `/metrics` endpoint is not yet exposed.
 - [ ] **CI** — no continuous-integration pipeline yet (build, clippy, unit +
   integration tests against an ephemeral TiKV on every push/PR). Container
   images are published via [`.github/workflows/docker-publish.yml`](.github/workflows/docker-publish.yml)
@@ -265,6 +265,35 @@ A TOML file (`--config pathlockd.toml` or `PATHLOCKD_CONFIG`) overlaid by
 | `event_buffer` | `PATHLOCKD_EVENT_BUFFER` | `8192` | in-process event channel capacity |
 | `enable_debug` | `PATHLOCKD_ENABLE_DEBUG` | `false` | enable the test-only `PathLockDebug` service |
 | `log_level` | `PATHLOCKD_LOG_LEVEL` | `info` | tracing filter |
+
+### OpenTelemetry
+
+Remote APM export is configured with standard `OTEL_*` environment variables,
+not TOML. Traces and metrics are enabled when `OTEL_EXPORTER_OTLP_ENDPOINT` (or
+the signal-specific traces/metrics endpoint) is set, or when the matching
+`OTEL_TRACES_EXPORTER` / `OTEL_METRICS_EXPORTER` includes `otlp`.
+
+Common variables:
+
+| Env var | Meaning |
+| --- | --- |
+| `OTEL_SERVICE_NAME` | service name resource attribute (defaults to `pathlockd`) |
+| `OTEL_RESOURCE_ATTRIBUTES` | extra resource attributes, e.g. `deployment.environment.name=prod` |
+| `OTEL_EXPORTER_OTLP_ENDPOINT` | shared OTLP collector/APM endpoint |
+| `OTEL_EXPORTER_OTLP_TRACES_ENDPOINT` | traces-only OTLP endpoint |
+| `OTEL_EXPORTER_OTLP_METRICS_ENDPOINT` | metrics-only OTLP endpoint |
+| `OTEL_EXPORTER_OTLP_PROTOCOL` | `http/protobuf` or `grpc` |
+| `OTEL_EXPORTER_OTLP_HEADERS` | comma-separated auth headers for HTTP OTLP |
+| `OTEL_SDK_DISABLED` | set to `true` to disable OTEL entirely |
+
+Example:
+
+```sh
+export OTEL_SERVICE_NAME=pathlockd
+export OTEL_RESOURCE_ATTRIBUTES=deployment.environment.name=prod,service.namespace=locks
+export OTEL_EXPORTER_OTLP_ENDPOINT=https://otel-collector.example:4318
+export OTEL_EXPORTER_OTLP_PROTOCOL=http/protobuf
+```
 
 ## gRPC API
 

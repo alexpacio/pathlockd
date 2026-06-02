@@ -20,6 +20,20 @@ Resolution order, lowest to highest precedence:
 Env booleans accept `1/true/yes/on`. Env lists are comma-separated. `RUST_LOG`,
 if set, overrides `log_level` (standard `tracing-subscriber` env filter).
 
+OpenTelemetry has no TOML fields. `src/otel.rs` enables OTLP traces and metrics
+from standard env vars:
+
+- generic target: `OTEL_EXPORTER_OTLP_ENDPOINT`
+- signal-specific targets: `OTEL_EXPORTER_OTLP_TRACES_ENDPOINT`,
+  `OTEL_EXPORTER_OTLP_METRICS_ENDPOINT`
+- protocol/auth/resource: `OTEL_EXPORTER_OTLP_PROTOCOL`,
+  `OTEL_EXPORTER_OTLP_HEADERS`, `OTEL_SERVICE_NAME`,
+  `OTEL_RESOURCE_ATTRIBUTES`
+- disable switch: `OTEL_SDK_DISABLED=true`
+
+When no OTLP endpoint or `OTEL_*_EXPORTER=otlp` signal is present, remote OTEL
+export stays off and normal tracing logs still initialize.
+
 ## Operational notes
 
 - **Clocks:** lease expiry uses wall-clock time; run replicas under NTP.

@@ -27,6 +27,10 @@ async-stream = "=0.3.6"
 futures = "=0.3.32"
 tracing = "=0.1.44"
 tracing-subscriber = { version = "=0.3.23", features = ["env-filter", "fmt"] }
+tracing-opentelemetry = { version = "=0.33.0", default-features = false }
+opentelemetry = { version = "=0.32.0", default-features = false, features = ["metrics", "trace"] }
+opentelemetry_sdk = { version = "=0.32.1", default-features = false, features = ["metrics", "trace"] }
+opentelemetry-otlp = { version = "=0.32.0", default-features = false, features = ["grpc-tonic", "http-proto", "metrics", "reqwest-blocking-client", "tls", "tls-roots", "trace"] }
 serde = { version = "=1.0.228", features = ["derive"] }
 bincode = { version = "=2.0.1", features = ["serde"] }
 toml = "=1.1.2"

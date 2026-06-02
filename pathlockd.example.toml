@@ -27,3 +27,9 @@ enable_debug = false
 
 # tracing log filter.
 log_level = "info"
+
+# OpenTelemetry tracing/metrics export is configured via standard OTEL_* env
+# vars, not TOML. For example:
+# OTEL_SERVICE_NAME=pathlockd
+# OTEL_EXPORTER_OTLP_ENDPOINT=https://otel-collector.example:4318
+# OTEL_EXPORTER_OTLP_PROTOCOL=http/protobuf
