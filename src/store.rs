@@ -63,6 +63,9 @@ pub const FENCE_MIN_TTL_MS: u64 = 86_400_000;
 
 /// Bounded retry budget for transient TiKV errors.
 pub const MAX_RETRY: u32 = 40;
+/// Default guardrail for live set members enumerated inside one request
+/// transaction.
+pub const MAX_SET_ENUM_MEMBERS: usize = 65_536;
 const SET_SCAN_PAGE: u32 = 1024;
 const SET_MEMBER_PREFIX: &str = "fslock:setm:";
 
@@ -99,6 +102,9 @@ pub fn wrdesc_key(anc: &str) -> String {
 pub fn rddesc_key(anc: &str) -> String {
     format!("{PREFIX}idx:rddesc:{anc}")
 }
+pub fn claimdesc_key(anc: &str) -> String {
+    format!("{PREFIX}idx:claimdesc:{anc}")
+}
 
 /// The serialization key for a handler (the segment before the first `:` of a
 /// path, e.g. `google_drive` in `google_drive:/a/b`).
@@ -124,6 +130,14 @@ pub fn handler_of(path: &str) -> &str {
 pub enum Stored {
     Str { v: String, exp: u64 },
     Counter { v: i64 },
+}
+
+#[derive(Debug, Clone, thiserror::Error)]
+#[error("{operation} on set {key} would enumerate more than {limit} live members")]
+pub struct SetScanLimitExceeded {
+    pub key: String,
+    pub operation: &'static str,
+    pub limit: usize,
 }
 
 impl Stored {
@@ -505,9 +519,14 @@ impl Tx {
         self.raw_put(key, &Stored::Counter { v }).await
     }
 
-    // --- set ops (rd / own / idx:wrdesc / idx:rddesc) ---
+    // --- set ops (rd / own / idx:wrdesc / idx:rddesc / idx:claimdesc) ---
 
-    async fn scan_set_members(&mut self, key: &str) -> anyhow::Result<BTreeMap<String, u64>> {
+    async fn scan_set_members(
+        &mut self,
+        key: &str,
+        operation: &'static str,
+        limit: Option<usize>,
+    ) -> anyhow::Result<BTreeMap<String, u64>> {
         let prefix = set_member_prefix(key);
         let upper = set_member_upper(&prefix);
         let mut cursor = prefix.as_bytes().to_vec();
@@ -537,6 +556,14 @@ impl Tx {
                 match decode(pair.value())? {
                     Stored::Str { exp, .. } if !expired(exp, self.now) => {
                         live.insert(member, exp);
+                        if let Some(limit) = limit.filter(|limit| live.len() > *limit) {
+                            return Err(SetScanLimitExceeded {
+                                key: key.to_string(),
+                                operation,
+                                limit,
+                            }
+                            .into());
+                        }
                     }
                     Stored::Str { .. } => {}
                     other => anyhow::bail!(
@@ -560,7 +587,7 @@ impl Tx {
     /// Load the *live* members of a set (expired members filtered out). Returns
     /// `None` when the key is absent or has no live members.
     async fn load_set(&mut self, key: &str) -> anyhow::Result<Option<BTreeMap<String, u64>>> {
-        let live = self.scan_set_members(key).await?;
+        let live = self.scan_set_members(key, "load_set", None).await?;
         if live.is_empty() {
             Ok(None)
         } else {
@@ -641,23 +668,80 @@ impl Tx {
             .unwrap_or_default())
     }
 
+    pub async fn smembers_limited(
+        &mut self,
+        key: &str,
+        limit: usize,
+    ) -> anyhow::Result<Vec<String>> {
+        Ok(self
+            .scan_set_members(key, "smembers", Some(limit))
+            .await?
+            .into_keys()
+            .collect())
+    }
+
     pub async fn scard(&mut self, key: &str) -> anyhow::Result<usize> {
         Ok(self.load_set(key).await?.map(|m| m.len()).unwrap_or(0))
     }
 
     pub async fn sismember(&mut self, key: &str, member: &str) -> anyhow::Result<bool> {
-        Ok(self
-            .load_set(key)
-            .await?
-            .map(|m| m.contains_key(member))
-            .unwrap_or(false))
+        let mk = set_member_key(key, member);
+        Ok(match self.raw_get(&mk).await? {
+            Some(Stored::Str { exp, .. }) => !expired(exp, self.now),
+            Some(other) => anyhow::bail!("key {mk} has type {}, expected string", other.kind()),
+            None => false,
+        })
+    }
+
+    pub async fn has_live_member(&mut self, key: &str) -> anyhow::Result<bool> {
+        let prefix = set_member_prefix(key);
+        let upper = set_member_upper(&prefix);
+        let mut cursor = prefix.as_bytes().to_vec();
+
+        loop {
+            let pairs: Vec<tikv_client::KvPair> = self
+                .txn
+                .scan(
+                    Key::from(cursor.clone())..Key::from(upper.clone()),
+                    SET_SCAN_PAGE,
+                )
+                .await?
+                .collect();
+            if pairs.is_empty() {
+                return Ok(false);
+            }
+
+            let got = pairs.len();
+            let mut last_key = Vec::new();
+            for pair in pairs {
+                let kb: Vec<u8> = pair.key().clone().into();
+                last_key = kb.clone();
+                match decode(pair.value())? {
+                    Stored::Str { exp, .. } if !expired(exp, self.now) => return Ok(true),
+                    Stored::Str { .. } => {}
+                    other => anyhow::bail!(
+                        "set member key {:?} has type {}, expected string",
+                        String::from_utf8_lossy(&kb),
+                        other.kind()
+                    ),
+                }
+            }
+
+            if got < SET_SCAN_PAGE as usize {
+                return Ok(false);
+            }
+            cursor = last_key;
+            cursor.push(0);
+        }
     }
 
     /// `PEXPIRE key ttl` for a set: renew every live member to `now + ttl`. Used
     /// only for the owner set, whose members all share that owner's single
     /// lease.
     pub async fn pexpire_set(&mut self, key: &str, ttl_ms: u64) -> anyhow::Result<()> {
-        let members = self.scan_set_members(key).await?;
+        let members = self
+            .scan_set_members(key, "pexpire_set", Some(MAX_SET_ENUM_MEMBERS))
+            .await?;
         let exp = expiry_at(self.now, ttl_ms);
         for member in members.into_keys() {
             let mk = set_member_key(key, &member);

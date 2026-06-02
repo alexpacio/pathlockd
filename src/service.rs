@@ -31,7 +31,13 @@ use crate::proto::{
 /// retries; anything else is a genuine internal fault — logged in full, but
 /// reported to the client without the internal detail.
 fn engine_err(e: anyhow::Error) -> Status {
-    if crate::store::is_retryable(&e) {
+    if e.downcast_ref::<crate::store::SetScanLimitExceeded>()
+        .is_some()
+    {
+        Status::resource_exhausted(
+            "lock set too large for one request; use narrower locks or split the owner lease",
+        )
+    } else if crate::store::is_retryable(&e) {
         Status::unavailable("storage temporarily unavailable (contention/region churn); retry")
     } else {
         tracing::error!(error = %e, "internal error serving request");
@@ -219,6 +225,9 @@ pub struct PathLockService {
 }
 
 impl PathLockService {
+    // Build the production gRPC service around a shared TiKV transaction client
+    // and event broadcaster. The service itself is cheap to clone through tonic's
+    // generated server wrapper; all durable state still lives in TiKV.
     pub fn new(client: Arc<TransactionClient>, broadcaster: Broadcaster) -> Self {
         Self {
             client,
@@ -232,6 +241,10 @@ const PATH_LOCK_SERVICE: &str = "pathlockd.v1.PathLock";
 
 #[tonic::async_trait]
 impl PathLock for PathLockService {
+    // Atomically acquire or refresh one owner's requested locks, optionally
+    // folding release requests into the same transaction for shadowing
+    // transitions. Returns protocol-level OK/CONFLICT/LOST outcomes rather than
+    // treating lock contention as a gRPC error.
     async fn acquire(
         &self,
         request: Request<AcquireRequest>,
@@ -331,6 +344,10 @@ impl PathLock for PathLockService {
         .await
     }
 
+    // Release a selected subset of locks held by an owner. Successful release
+    // publishes a RELEASED event so waiters/subscribers can wake promptly, while
+    // `del_wait_key` lets clients clear their wait-for edge atomically with the
+    // release.
     async fn release(
         &self,
         request: Request<ReleaseLocksRequest>,
@@ -371,6 +388,9 @@ impl PathLock for PathLockService {
         .await
     }
 
+    // Release every lock owned by one owner and optionally remove its wait edge.
+    // This is the cleanup path used by normal owner shutdown and by clients that
+    // abandon a lock batch wholesale.
     async fn release_all(
         &self,
         request: Request<ReleaseAllRequest>,
@@ -392,6 +412,9 @@ impl PathLock for PathLockService {
         .await
     }
 
+    // Extend the lease for all currently held locks owned by `owner_id`. A LOST
+    // response means durable state is already missing or expired, so the caller
+    // must stop entering critical sections for that owner.
     async fn renew(
         &self,
         request: Request<RenewRequest>,
@@ -419,6 +442,9 @@ impl PathLock for PathLockService {
         .await
     }
 
+    // Forcibly remove all state for a victim owner and publish a KILLED event.
+    // This is the administrative/deadlock-recovery escape hatch when cooperative
+    // release is not enough.
     async fn force_release(
         &self,
         request: Request<ForceReleaseRequest>,
@@ -440,6 +466,9 @@ impl PathLock for PathLockService {
         .await
     }
 
+    // Verify that an owner still holds every requested write path with the exact
+    // fencing token supplied by the client. This is the pre-critical-section
+    // safety check that detects stale owners or superseded tokens.
     async fn assert_fencing(
         &self,
         request: Request<AssertFencingRequest>,
@@ -487,6 +516,9 @@ impl PathLock for PathLockService {
         .await
     }
 
+    // Walk the wait-for graph starting at one owner and report whether it loops
+    // back to that owner. The walk is advisory and bounded; clients can re-run it
+    // when the response is truncated.
     async fn detect_cycle(
         &self,
         request: Request<DetectCycleRequest>,
@@ -522,6 +554,9 @@ impl PathLock for PathLockService {
         .await
     }
 
+    // Re-check whether a previously reported conflict is still blocking. Waiters
+    // use this to avoid sleeping on stale wait edges after a lock owner releases
+    // or expires.
     async fn is_blocking(
         &self,
         request: Request<IsBlockingRequest>,
@@ -549,6 +584,8 @@ impl PathLock for PathLockService {
         .await
     }
 
+    // Issue a cluster-wide monotonic fencing token using TiKV PD's timestamp
+    // oracle. Write acquires must present a positive token from this RPC.
     async fn incr_fencing_token(
         &self,
         request: Request<IncrFencingTokenRequest>,
@@ -567,6 +604,9 @@ impl PathLock for PathLockService {
         .await
     }
 
+    // Persist one owner -> blocker wait edge, optionally including the exact
+    // conflict path/reason that created the edge. Deadlock detection follows
+    // these edges; metadata lets stale edges self-prune.
     async fn set_wait_edge(
         &self,
         request: Request<SetWaitEdgeRequest>,
@@ -609,6 +649,8 @@ impl PathLock for PathLockService {
         .await
     }
 
+    // Remove an owner's wait edge. Clients call this when they stop waiting so
+    // future deadlock walks do not follow obsolete blocker relationships.
     async fn clear_wait_edge(
         &self,
         request: Request<ClearWaitEdgeRequest>,
@@ -629,6 +671,9 @@ impl PathLock for PathLockService {
         .await
     }
 
+    // Return whether an owner's liveness key is currently present and unexpired.
+    // This is an advisory client helper; the engine still re-checks liveness
+    // inside the transactions that need it.
     async fn is_owner_alive(
         &self,
         request: Request<IsOwnerAliveRequest>,
@@ -649,6 +694,10 @@ impl PathLock for PathLockService {
         .await
     }
 
+    // Ask an owner to cooperatively release by publishing a REVOKE event. When
+    // provided, a short-lived preemption claim is planted first so the intended
+    // claimant can acquire the contested path before the revoked owner re-grabs
+    // it.
     async fn request_revoke(
         &self,
         request: Request<RequestRevokeRequest>,
@@ -705,6 +754,9 @@ impl PathLock for PathLockService {
 
     type SubscribeStream = EventStream;
 
+    // Open a per-owner event stream. The broadcaster routes only RELEASED,
+    // KILLED and REVOKE events for this owner, so each subscription wakes only
+    // for lifecycle changes relevant to its owner id.
     async fn subscribe(
         &self,
         request: Request<SubscribeRequest>,
@@ -727,6 +779,9 @@ impl PathLock for PathLockService {
         .await
     }
 
+    // Receive a lifecycle event forwarded by a peer replica and deliver it
+    // locally without re-forwarding. This keeps cross-instance fan-out useful
+    // without creating event loops.
     async fn publish_event(
         &self,
         request: Request<PublishEventRequest>,
@@ -748,6 +803,8 @@ impl PathLock for PathLockService {
         .await
     }
 
+    // Readiness probe for clients and container health checks. It succeeds only
+    // when the daemon can open and roll back a TiKV transaction.
     async fn health(
         &self,
         request: Request<HealthRequest>,
@@ -872,6 +929,20 @@ mod tests {
             r#type: 99,
             owner_id: "owner-42".into(),
         })));
+    }
+
+    #[test]
+    fn engine_err_maps_set_scan_limit_to_resource_exhausted() {
+        let status = engine_err(
+            crate::store::SetScanLimitExceeded {
+                key: "fslock:idx:wrdesc:h:/".into(),
+                operation: "smembers",
+                limit: 2,
+            }
+            .into(),
+        );
+
+        assert_eq!(status.code(), tonic::Code::ResourceExhausted);
     }
 
     #[test]

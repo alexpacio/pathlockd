@@ -11,8 +11,8 @@ use tikv_client::{TimestampExt, TransactionClient};
 use tracing::warn;
 
 use crate::store::{
-    alive_key, claim_key, fence_key, handler_of, own_key, rd_key, rddesc_key, wait_key, wr_key,
-    wrdesc_key, Tx, FENCE_MIN_TTL_MS, FENCING_COUNTER_KEY,
+    alive_key, claim_key, claimdesc_key, fence_key, handler_of, own_key, rd_key, rddesc_key,
+    wait_key, wr_key, wrdesc_key, Tx, FENCE_MIN_TTL_MS, FENCING_COUNTER_KEY, MAX_SET_ENUM_MEMBERS,
 };
 
 /// Above this many descendant-index members a single scan starts to
@@ -168,9 +168,9 @@ async fn owner_alive(tx: &mut Tx, owner: &str) -> anyhow::Result<bool> {
 }
 
 /// `prune_dead_read_owners`: drop read owners whose alive key is gone and return
-/// the survivors; delete the read set if it empties out.
+/// the survivors. Expired per-member keys are left for active GC.
 async fn prune_dead_read_owners(tx: &mut Tx, rd: &str) -> anyhow::Result<Vec<String>> {
-    let owners = tx.smembers(rd).await?;
+    let owners = tx.smembers_limited(rd, MAX_SET_ENUM_MEMBERS).await?;
     let mut alive = Vec::new();
     for o in owners {
         if owner_alive(tx, &o).await? {
@@ -178,9 +178,6 @@ async fn prune_dead_read_owners(tx: &mut Tx, rd: &str) -> anyhow::Result<Vec<Str
         } else {
             tx.srem(rd, &o).await?;
         }
-    }
-    if tx.scard(rd).await? == 0 {
-        tx.del_set(rd).await?;
     }
     Ok(alive)
 }
@@ -210,6 +207,7 @@ async fn get_live_claim(tx: &mut Tx, path: &str) -> anyhow::Result<Option<String
         return Ok(Some(claimant));
     }
     tx.del(&claim_k).await?;
+    remove_claim_indexes(tx, path).await?;
     Ok(None)
 }
 
@@ -235,6 +233,20 @@ async fn find_blocking_claim(
         }
     }
     Ok(None)
+}
+
+async fn add_claim_indexes(tx: &mut Tx, path: &str, ttl_ms: u64) -> anyhow::Result<()> {
+    for anc in get_ancestors(path) {
+        tx.sadd(&claimdesc_key(&anc), path, ttl_ms).await?;
+    }
+    Ok(())
+}
+
+async fn remove_claim_indexes(tx: &mut Tx, path: &str) -> anyhow::Result<()> {
+    for anc in get_ancestors(path) {
+        tx.srem(&claimdesc_key(&anc), path).await?;
+    }
+    Ok(())
 }
 
 async fn add_descendant_indexes(
@@ -272,11 +284,11 @@ async fn find_descendant_write_conflict(
     path: &str,
 ) -> anyhow::Result<Option<(String, String, String)>> {
     let idx = wrdesc_key(path);
-    let card = tx.scard(&idx).await?;
-    if card > SCAN_WARN_THRESHOLD {
-        warn!(key = %idx, count = card, "fslock: large wrdesc scan");
+    let candidates = tx.smembers_limited(&idx, MAX_SET_ENUM_MEMBERS).await?;
+    if candidates.len() > SCAN_WARN_THRESHOLD {
+        warn!(key = %idx, count = candidates.len(), "fslock: large wrdesc scan");
     }
-    for candidate in tx.smembers(&idx).await? {
+    for candidate in candidates {
         match get_live_write_owner(tx, &candidate).await? {
             None => {
                 tx.srem(&idx, &candidate).await?;
@@ -288,9 +300,6 @@ async fn find_descendant_write_conflict(
             Some(_) => {}
         }
     }
-    if tx.scard(&idx).await? == 0 {
-        tx.del_set(&idx).await?;
-    }
     Ok(None)
 }
 
@@ -300,11 +309,11 @@ async fn find_descendant_read_conflict(
     path: &str,
 ) -> anyhow::Result<Option<(String, String, String)>> {
     let idx = rddesc_key(path);
-    let card = tx.scard(&idx).await?;
-    if card > SCAN_WARN_THRESHOLD {
-        warn!(key = %idx, count = card, "fslock: large rddesc scan");
+    let candidates = tx.smembers_limited(&idx, MAX_SET_ENUM_MEMBERS).await?;
+    if candidates.len() > SCAN_WARN_THRESHOLD {
+        warn!(key = %idx, count = candidates.len(), "fslock: large rddesc scan");
     }
-    for candidate in tx.smembers(&idx).await? {
+    for candidate in candidates {
         let rd = rd_key(&candidate);
         let owners = prune_dead_read_owners(tx, &rd).await?;
         if owners.is_empty() {
@@ -318,10 +327,59 @@ async fn find_descendant_read_conflict(
             }
         }
     }
-    if tx.scard(&idx).await? == 0 {
-        tx.del_set(&idx).await?;
+    Ok(None)
+}
+
+async fn find_descendant_claim_conflict(
+    tx: &mut Tx,
+    owner_id: &str,
+    path: &str,
+) -> anyhow::Result<Option<AcquireOutcome>> {
+    let idx = claimdesc_key(path);
+    let candidates = tx.smembers_limited(&idx, MAX_SET_ENUM_MEMBERS).await?;
+    if candidates.len() > SCAN_WARN_THRESHOLD {
+        warn!(key = %idx, count = candidates.len(), "fslock: large claimdesc scan");
+    }
+    for candidate in candidates {
+        match get_live_claim(tx, &candidate).await? {
+            None => {
+                tx.srem(&idx, &candidate).await?;
+                remove_claim_indexes(tx, &candidate).await?;
+            }
+            Some(claimant) if claimant != owner_id => {
+                return Ok(Some(conflict(
+                    &candidate,
+                    &claimant,
+                    REASON_PREEMPT_CLAIMED,
+                )));
+            }
+            Some(_) => {}
+        }
     }
     Ok(None)
+}
+
+async fn remove_owned_descendant_claims(
+    tx: &mut Tx,
+    owner_id: &str,
+    path: &str,
+) -> anyhow::Result<()> {
+    let idx = claimdesc_key(path);
+    let candidates = tx.smembers_limited(&idx, MAX_SET_ENUM_MEMBERS).await?;
+    for candidate in candidates {
+        match get_live_claim(tx, &candidate).await? {
+            None => {
+                tx.srem(&idx, &candidate).await?;
+                remove_claim_indexes(tx, &candidate).await?;
+            }
+            Some(claimant) if claimant == owner_id => {
+                tx.del(&claim_key(&candidate)).await?;
+                remove_claim_indexes(tx, &candidate).await?;
+            }
+            Some(_) => {}
+        }
+    }
+    Ok(())
 }
 
 // ---------------------------------------------------------------------------
@@ -416,6 +474,9 @@ async fn acquire_inner(tx: &mut Tx, args: &AcquireArgs) -> anyhow::Result<Acquir
                     return Ok(outcome);
                 }
                 if req.mode == Mode::Write {
+                    if let Some(outcome) = find_descendant_claim_conflict(tx, owner, path).await? {
+                        return Ok(outcome);
+                    }
                     // Reads are point-only: an ancestor read does not cover this path.
                     let rd_owners = prune_dead_read_owners(tx, &rd_key(path)).await?;
                     if rd_owners.is_empty() {
@@ -468,6 +529,7 @@ async fn acquire_inner(tx: &mut Tx, args: &AcquireArgs) -> anyhow::Result<Acquir
         let claim_k = claim_key(path);
         if tx.get_str(&claim_k).await?.as_deref() == Some(owner.as_str()) {
             tx.del(&claim_k).await?;
+            remove_claim_indexes(tx, path).await?;
         }
 
         if req.mode == Mode::Write {
@@ -503,13 +565,12 @@ async fn acquire_inner(tx: &mut Tx, args: &AcquireArgs) -> anyhow::Result<Acquir
                     }
                 }
             }
+            remove_owned_descendant_claims(tx, owner, path).await?;
         } else {
             tx.sadd(&rd_key(path), owner, ttl).await?;
             add_descendant_indexes(tx, Mode::Read, path, ttl).await?;
         }
     }
-
-    tx.pexpire_set(&own_k, ttl).await?;
 
     // 2b. REFRESH THE REST OF THE LEASE.
     let requested: std::collections::HashSet<String> = args
@@ -517,7 +578,7 @@ async fn acquire_inner(tx: &mut Tx, args: &AcquireArgs) -> anyhow::Result<Acquir
         .iter()
         .map(|r| format!("{}:{}", r.mode.as_str(), &r.path))
         .collect();
-    for member in tx.smembers(&own_k).await? {
+    for member in tx.smembers_limited(&own_k, MAX_SET_ENUM_MEMBERS).await? {
         if requested.contains(&member) {
             continue; // already refreshed above, with full New/Held handling
         }
@@ -543,6 +604,7 @@ async fn acquire_inner(tx: &mut Tx, args: &AcquireArgs) -> anyhow::Result<Acquir
                 }
             }
             add_descendant_indexes(tx, Mode::Write, &path, ttl).await?;
+            tx.sadd(&own_k, &member, ttl).await?;
         } else if mode == "read" {
             let rd = rd_key(&path);
             if !tx.sismember(&rd, owner).await? {
@@ -550,6 +612,7 @@ async fn acquire_inner(tx: &mut Tx, args: &AcquireArgs) -> anyhow::Result<Acquir
             }
             tx.sadd(&rd, owner, ttl).await?;
             add_descendant_indexes(tx, Mode::Read, &path, ttl).await?;
+            tx.sadd(&own_k, &member, ttl).await?;
         }
     }
 
@@ -569,15 +632,13 @@ async fn acquire_inner(tx: &mut Tx, args: &AcquireArgs) -> anyhow::Result<Acquir
             } else {
                 let rd = rd_key(path);
                 tx.srem(&rd, owner).await?;
-                if tx.scard(&rd).await? == 0 {
-                    tx.del_set(&rd).await?;
+                if !tx.has_live_member(&rd).await? {
                     remove_descendant_indexes(tx, Mode::Read, path).await?;
                 }
             }
         }
 
-        if tx.scard(&own_k).await? == 0 {
-            tx.del_set(&own_k).await?;
+        if !tx.has_live_member(&own_k).await? {
             tx.del(&alive_k).await?;
         }
     }
@@ -625,15 +686,13 @@ async fn release_inner(
         } else {
             let rd = rd_key(path);
             tx.srem(&rd, owner).await?;
-            if tx.scard(&rd).await? == 0 {
-                tx.del_set(&rd).await?;
+            if !tx.has_live_member(&rd).await? {
                 remove_descendant_indexes(tx, Mode::Read, path).await?;
             }
         }
     }
 
-    if tx.scard(&own_k).await? == 0 {
-        tx.del_set(&own_k).await?;
+    if !tx.has_live_member(&own_k).await? {
         tx.del(&alive_k).await?;
     }
 
@@ -659,7 +718,7 @@ pub async fn release_all(
 async fn release_all_inner(tx: &mut Tx, owner: &str, del_wait_key: bool) -> anyhow::Result<()> {
     let own_k = own_key(owner);
     let alive_k = alive_key(owner);
-    let held = tx.smembers(&own_k).await?;
+    let held = tx.smembers_limited(&own_k, MAX_SET_ENUM_MEMBERS).await?;
 
     for item in &held {
         if let Some(sep) = item.find(':') {
@@ -667,10 +726,10 @@ async fn release_all_inner(tx: &mut Tx, owner: &str, del_wait_key: bool) -> anyh
         }
     }
 
-    for item in held {
+    for item in &held {
         match item.find(':') {
             None => {
-                tx.srem(&own_k, &item).await?;
+                tx.srem(&own_k, item).await?;
             }
             Some(sep) => {
                 let mode = &item[..sep];
@@ -684,8 +743,7 @@ async fn release_all_inner(tx: &mut Tx, owner: &str, del_wait_key: bool) -> anyh
                 } else if mode == "read" {
                     let rd = rd_key(path);
                     tx.srem(&rd, owner).await?;
-                    if tx.scard(&rd).await? == 0 {
-                        tx.del_set(&rd).await?;
+                    if !tx.has_live_member(&rd).await? {
                         remove_descendant_indexes(tx, Mode::Read, path).await?;
                     }
                 }
@@ -693,7 +751,9 @@ async fn release_all_inner(tx: &mut Tx, owner: &str, del_wait_key: bool) -> anyh
         }
     }
 
-    tx.del_set(&own_k).await?;
+    for item in &held {
+        tx.srem(&own_k, item).await?;
+    }
     tx.del(&alive_k).await?;
     if del_wait_key {
         tx.del(&wait_key(owner)).await?;
@@ -729,12 +789,10 @@ async fn renew_inner(tx: &mut Tx, owner: &str, ttl_ms: u64) -> anyhow::Result<Re
     }
     tx.pexpire_str(&alive_k, ttl_ms).await?;
 
-    if tx.scard(&own_k).await? == 0 {
+    let held = tx.smembers_limited(&own_k, MAX_SET_ENUM_MEMBERS).await?;
+    if held.is_empty() {
         return Ok(renew_lost("", "missing_owner_set"));
     }
-    tx.pexpire_set(&own_k, ttl_ms).await?;
-
-    let held = tx.smembers(&own_k).await?;
 
     for item in &held {
         if let Some(sep) = item.find(':') {
@@ -744,10 +802,10 @@ async fn renew_inner(tx: &mut Tx, owner: &str, ttl_ms: u64) -> anyhow::Result<Re
 
     let mut renewed = 0usize;
 
-    for item in held {
+    for item in &held {
         match item.find(':') {
             None => {
-                tx.srem(&own_k, &item).await?;
+                tx.srem(&own_k, item).await?;
             }
             Some(sep) => {
                 let mode = &item[..sep];
@@ -764,6 +822,7 @@ async fn renew_inner(tx: &mut Tx, owner: &str, ttl_ms: u64) -> anyhow::Result<Re
                     }
                     tx.pexpire_str(&fence_k, fence_ttl).await?;
                     add_descendant_indexes(tx, Mode::Write, &path, ttl_ms).await?;
+                    tx.sadd(&own_k, item, ttl_ms).await?;
                     renewed += 1;
                 } else if mode == "read" {
                     let rd = rd_key(&path);
@@ -776,12 +835,13 @@ async fn renew_inner(tx: &mut Tx, owner: &str, ttl_ms: u64) -> anyhow::Result<Re
                         // never the whole set — other readers keep their own leases.
                         tx.sadd(&rd, owner, ttl_ms).await?;
                         add_descendant_indexes(tx, Mode::Read, &path, ttl_ms).await?;
+                        tx.sadd(&own_k, item, ttl_ms).await?;
                         renewed += 1;
                     } else {
                         return Ok(renew_lost(&path, "missing_read"));
                     }
                 } else {
-                    tx.srem(&own_k, &item).await?;
+                    tx.srem(&own_k, item).await?;
                 }
             }
         }
@@ -803,7 +863,7 @@ pub async fn force_release(client: &TransactionClient, victim: &str) -> anyhow::
 
 async fn force_release_inner(tx: &mut Tx, victim: &str) -> anyhow::Result<()> {
     let own_k = own_key(victim);
-    let held = tx.smembers(&own_k).await?;
+    let held = tx.smembers_limited(&own_k, MAX_SET_ENUM_MEMBERS).await?;
 
     for item in &held {
         if let Some(sep) = item.find(':') {
@@ -811,10 +871,10 @@ async fn force_release_inner(tx: &mut Tx, victim: &str) -> anyhow::Result<()> {
         }
     }
 
-    for item in held {
+    for item in &held {
         match item.find(':') {
             None => {
-                tx.srem(&own_k, &item).await?;
+                tx.srem(&own_k, item).await?;
             }
             Some(sep) => {
                 let mode = &item[..sep];
@@ -828,8 +888,7 @@ async fn force_release_inner(tx: &mut Tx, victim: &str) -> anyhow::Result<()> {
                 } else {
                     let rd = rd_key(path);
                     tx.srem(&rd, victim).await?;
-                    if tx.scard(&rd).await? == 0 {
-                        tx.del_set(&rd).await?;
+                    if !tx.has_live_member(&rd).await? {
                         remove_descendant_indexes(tx, Mode::Read, path).await?;
                     }
                 }
@@ -837,7 +896,9 @@ async fn force_release_inner(tx: &mut Tx, victim: &str) -> anyhow::Result<()> {
         }
     }
 
-    tx.del_set(&own_k).await?;
+    for item in &held {
+        tx.srem(&own_k, item).await?;
+    }
     tx.del(&alive_key(victim)).await?;
     tx.del(&wait_key(victim)).await?;
     Ok(())
@@ -1051,8 +1112,7 @@ async fn is_blocking_inner(
         }
         // Owner is dead: prune so future acquires don't see it.
         tx.srem(&rd, conflict_owner).await?;
-        if tx.scard(&rd).await? == 0 {
-            tx.del_set(&rd).await?;
+        if !tx.has_live_member(&rd).await? {
             remove_descendant_indexes(tx, Mode::Read, conflict_path).await?;
         }
         return Ok(false);
@@ -1127,7 +1187,8 @@ pub async fn set_claim(
     txn_retry!(client, tx => {
         async {
             tx.serialize_handler(handler_of(path)).await?;
-            tx.set_str(&claim_key(path), claimant, ttl).await
+            tx.set_str(&claim_key(path), claimant, ttl).await?;
+            add_claim_indexes(&mut tx, path, ttl).await
         }.await
     })
 }

@@ -961,3 +961,52 @@ fn force_release_unblocks_a_waiter() {
         );
     });
 }
+
+#[test]
+fn descendant_preemption_claim_blocks_ancestor_write() {
+    run(async {
+        let c = fresh().await;
+        assert_eq!(
+            acq(c, "winner", vec![w("/winner-anchor", State::New)], 1).await,
+            AcquireOutcome::Ok
+        );
+
+        engine::set_claim(c, &rp("/a/b"), "winner", TTL)
+            .await
+            .unwrap();
+
+        match acq(c, "other", vec![w("/a", State::New)], 2).await {
+            AcquireOutcome::Conflict {
+                path,
+                owner,
+                reason,
+            } => {
+                assert_eq!(path, rp("/a/b"));
+                assert_eq!(owner, "winner");
+                assert_eq!(reason, engine::REASON_PREEMPT_CLAIMED);
+            }
+            o => panic!("expected ancestor write to be blocked by descendant claim, got {o:?}"),
+        }
+
+        // Reads are still point-only: a claim on /a/b does not reserve /a itself.
+        assert_eq!(
+            acq(c, "reader", vec![r("/a", State::New)], 0).await,
+            AcquireOutcome::Ok
+        );
+
+        engine::release_all(c, "reader", false).await.unwrap();
+        assert_eq!(
+            acq(c, "winner", vec![w("/a", State::New)], 3).await,
+            AcquireOutcome::Ok
+        );
+        engine::release(c, "winner", &[rel_w("/a")], false)
+            .await
+            .unwrap();
+
+        assert_eq!(
+            acq(c, "other", vec![w("/a/b", State::New)], 4).await,
+            AcquireOutcome::Ok,
+            "covering ancestor acquire should consume the descendant claim"
+        );
+    });
+}
