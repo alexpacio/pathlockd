@@ -1190,6 +1190,54 @@ pub async fn census(client: &TransactionClient) -> anyhow::Result<KeyCensus> {
     Ok(census)
 }
 
+const ALIVE_PREFIX: &str = "fslock:alive:";
+
+/// The cursor that starts a [`scan_alive_owners`] paging loop.
+pub fn alive_scan_start() -> Vec<u8> {
+    ALIVE_PREFIX.as_bytes().to_vec()
+}
+
+/// Scan one page of owner ids that currently have an `fslock:alive:<owner>` key,
+/// starting at `cursor` (use [`alive_scan_start`] for the first page). Returns
+/// the decoded owner ids plus the cursor for the next page (`None` once the scan
+/// is complete).
+///
+/// The scan is loose: it does not filter expired-but-unswept alive keys, since
+/// the caller re-reads each owner's liveness inside its own snapshot transaction
+/// (lazy-expiry aware) before reporting that owner's locks. It exists for the
+/// cluster-wide lock dump, which is best-effort observability, not a hot path.
+pub async fn scan_alive_owners(
+    client: &TransactionClient,
+    cursor: &[u8],
+    page: u32,
+) -> anyhow::Result<(Vec<String>, Option<Vec<u8>>)> {
+    if page == 0 {
+        anyhow::bail!("alive scan page must be > 0");
+    }
+    let end: Vec<u8> = b"fslock:alive;".to_vec(); // ':' + 1, exclusive upper bound
+    let pairs = gc_scan_page(client, cursor, &end, page).await?;
+    let got = pairs.len();
+    let mut owners = Vec::with_capacity(got);
+    let mut last_key: Vec<u8> = Vec::new();
+    for p in &pairs {
+        let kb: Vec<u8> = p.key().clone().into();
+        last_key = kb.clone();
+        if let Some(owner) = kb.strip_prefix(ALIVE_PREFIX.as_bytes()) {
+            if let Ok(owner) = std::str::from_utf8(owner) {
+                owners.push(owner.to_string());
+            }
+        }
+    }
+    let next = if got < page as usize {
+        None
+    } else {
+        let mut c = last_key;
+        c.push(0);
+        Some(c)
+    };
+    Ok((owners, next))
+}
+
 /// Count visible live keys under the `fslock:` prefix.
 pub async fn count_all(client: &TransactionClient) -> anyhow::Result<u64> {
     let mut cursor: Vec<u8> = PREFIX.as_bytes().to_vec();

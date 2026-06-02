@@ -1199,6 +1199,194 @@ pub async fn is_owner_alive(client: &TransactionClient, owner: &str) -> anyhow::
 }
 
 // ---------------------------------------------------------------------------
+// Inspection (read-only observability)
+// ---------------------------------------------------------------------------
+
+/// A point-in-time view of the lock state at one exact path. Filtered by owner
+/// liveness so it reflects what would actually block, but read-only: dead-owner
+/// entries are reported as absent, not pruned (active acquires and GC do that).
+#[derive(Debug, Clone, Default, PartialEq, Eq)]
+pub struct PathInfo {
+    pub write_owner: Option<String>,
+    pub read_owners: Vec<String>,
+    pub fence: Option<i64>,
+    pub claim_owner: Option<String>,
+}
+
+/// One lock held by an owner, as recorded in its owner set.
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub struct OwnedLock {
+    pub path: String,
+    pub mode: Mode,
+}
+
+/// Read the live lock state at `path`: write owner, read owners, fence value and
+/// any preemption claim, each gated on the holder's liveness key. Pure reads —
+/// no serialization key, no mutation — so it never blocks or prunes.
+pub async fn inspect_path(client: &TransactionClient, path: &str) -> anyhow::Result<PathInfo> {
+    txn_retry!(client, tx => { inspect_path_inner(&mut tx, path).await })
+}
+
+async fn inspect_path_inner(tx: &mut Tx, path: &str) -> anyhow::Result<PathInfo> {
+    let write_owner = match tx.get_str(&wr_key(path)).await? {
+        Some(owner) if owner_alive(tx, &owner).await? => Some(owner),
+        _ => None,
+    };
+
+    let mut read_owners = Vec::new();
+    for owner in tx
+        .smembers_limited(&rd_key(path), MAX_SET_ENUM_MEMBERS)
+        .await?
+    {
+        if owner_alive(tx, &owner).await? {
+            read_owners.push(owner);
+        }
+    }
+
+    let fence = parse_fence(tx.get_str(&fence_key(path)).await?);
+
+    let claim_owner = match tx.get_str(&claim_key(path)).await? {
+        Some(claimant) if owner_alive(tx, &claimant).await? => Some(claimant),
+        _ => None,
+    };
+
+    Ok(PathInfo {
+        write_owner,
+        read_owners,
+        fence,
+        claim_owner,
+    })
+}
+
+/// List every lock recorded in `owner`'s owner set, plus whether its liveness
+/// lease is still present. Pure read; the owner-set members are parsed back into
+/// `(path, mode)` pairs. Members with an unrecognized mode prefix (none are
+/// written today) are skipped defensively.
+pub async fn list_owner_locks(
+    client: &TransactionClient,
+    owner: &str,
+) -> anyhow::Result<(bool, Vec<OwnedLock>)> {
+    txn_retry!(client, tx => { list_owner_locks_inner(&mut tx, owner).await })
+}
+
+async fn list_owner_locks_inner(
+    tx: &mut Tx,
+    owner: &str,
+) -> anyhow::Result<(bool, Vec<OwnedLock>)> {
+    let alive = tx.exists_str(&alive_key(owner)).await?;
+    let members = tx
+        .smembers_limited(&own_key(owner), MAX_SET_ENUM_MEMBERS)
+        .await?;
+
+    let mut locks = Vec::with_capacity(members.len());
+    for member in members {
+        let Some(sep) = member.find(':') else {
+            continue;
+        };
+        let mode = match &member[..sep] {
+            "write" => Mode::Write,
+            "read" => Mode::Read,
+            _ => continue,
+        };
+        locks.push(OwnedLock {
+            path: member[sep + 1..].to_string(),
+            mode,
+        });
+    }
+    Ok((alive, locks))
+}
+
+/// One lock in a cluster-wide dump: a single (owner, mode, path) holding, plus
+/// the live fence value for write holdings.
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub struct LockEntry {
+    pub owner: String,
+    pub path: String,
+    pub mode: Mode,
+    /// Fence value for write locks; always `None` for reads.
+    pub fence: Option<i64>,
+}
+
+/// One page of [`dump_locks`]. `next_cursor` is `None` at the end of the scan;
+/// otherwise pass it back unchanged to fetch the next page.
+#[derive(Debug, Clone, Default)]
+pub struct LockDumpPage {
+    pub entries: Vec<LockEntry>,
+    pub next_cursor: Option<Vec<u8>>,
+}
+
+/// Dump every live lock across the cluster, one page of owners at a time. Walks
+/// the `fslock:alive:` owner index for `owner_page` owners, then expands each
+/// owner's owner set into one [`LockEntry`] per held (mode, path), reading the
+/// fence for write holdings. Every lock — read or write — is recorded in exactly
+/// one owner set, so the union over owners is the complete set of live locks.
+///
+/// Best-effort observability: each owner is expanded in its own snapshot, so the
+/// page is not a single global instant. Pass `cursor: None` for the first page.
+pub async fn dump_locks(
+    client: &TransactionClient,
+    cursor: Option<Vec<u8>>,
+    owner_page: u32,
+) -> anyhow::Result<LockDumpPage> {
+    let start = cursor.unwrap_or_else(crate::store::alive_scan_start);
+    let (owners, next_cursor) = crate::store::scan_alive_owners(client, &start, owner_page).await?;
+
+    let mut entries = Vec::new();
+    for owner in owners {
+        let owned = dump_owner_entries(client, &owner).await?;
+        entries.extend(owned);
+    }
+    Ok(LockDumpPage {
+        entries,
+        next_cursor,
+    })
+}
+
+/// Expand one owner's owner set into lock entries within a single read-only
+/// snapshot: liveness, owned members and per-write fences all read consistently.
+/// Returns empty when the owner's liveness lease is already gone.
+async fn dump_owner_entries(
+    client: &TransactionClient,
+    owner: &str,
+) -> anyhow::Result<Vec<LockEntry>> {
+    txn_retry!(client, tx => {
+        async {
+            if !tx.exists_str(&alive_key(owner)).await? {
+                return Ok(Vec::new());
+            }
+            let members = tx
+                .smembers_limited(&own_key(owner), MAX_SET_ENUM_MEMBERS)
+                .await?;
+            let mut out = Vec::with_capacity(members.len());
+            for member in members {
+                let Some(sep) = member.find(':') else {
+                    continue;
+                };
+                let mode = match &member[..sep] {
+                    "write" => Mode::Write,
+                    "read" => Mode::Read,
+                    _ => continue,
+                };
+                let path = member[sep + 1..].to_string();
+                let fence = if mode == Mode::Write {
+                    parse_fence(tx.get_str(&fence_key(&path)).await?)
+                } else {
+                    None
+                };
+                out.push(LockEntry {
+                    owner: owner.to_string(),
+                    path,
+                    mode,
+                    fence,
+                });
+            }
+            Ok::<Vec<LockEntry>, anyhow::Error>(out)
+        }
+        .await
+    })
+}
+
+// ---------------------------------------------------------------------------
 // Test-support ops. These let integration tests inject fault scenarios — kill an
 // owner, drop a key, plant a stale fence/owner, read raw state — without
 // coupling them to the storage byte layout. They are not exposed over gRPC.

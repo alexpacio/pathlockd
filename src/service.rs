@@ -17,13 +17,14 @@ use crate::events::Broadcaster;
 use crate::proto::{
     self, path_lock_server::PathLock, AcquireRequest, AcquireResponse, AcquireStatus,
     AssertFencingRequest, AssertFencingResponse, AssertStatus, ClearWaitEdgeRequest,
-    ClearWaitEdgeResponse, CycleKind, DetectCycleRequest, DetectCycleResponse, Event,
-    ForceReleaseRequest, ForceReleaseResponse, HealthRequest, HealthResponse,
-    IncrFencingTokenRequest, IncrFencingTokenResponse, IsBlockingRequest, IsBlockingResponse,
-    IsOwnerAliveRequest, IsOwnerAliveResponse, PublishEventRequest, PublishEventResponse,
-    ReleaseAllRequest, ReleaseLocksRequest, ReleaseResponse, RenewRequest, RenewResponse,
-    RenewStatus, RequestRevokeRequest, RequestRevokeResponse, SetWaitEdgeRequest,
-    SetWaitEdgeResponse, SubscribeRequest,
+    ClearWaitEdgeResponse, CycleKind, DetectCycleRequest, DetectCycleResponse, DumpLocksRequest,
+    DumpLocksResponse, Event, ForceReleaseRequest, ForceReleaseResponse, HealthRequest,
+    HealthResponse, IncrFencingTokenRequest, IncrFencingTokenResponse, InspectPathRequest,
+    InspectPathResponse, IsBlockingRequest, IsBlockingResponse, IsOwnerAliveRequest,
+    IsOwnerAliveResponse, ListOwnerLocksRequest, ListOwnerLocksResponse, LockEntry, OwnedLock,
+    PublishEventRequest, PublishEventResponse, ReleaseAllRequest, ReleaseLocksRequest,
+    ReleaseResponse, RenewRequest, RenewResponse, RenewStatus, RequestRevokeRequest,
+    RequestRevokeResponse, SetWaitEdgeRequest, SetWaitEdgeResponse, SubscribeRequest,
 };
 
 /// Map an engine error to a gRPC status. A transient TiKV error that survived
@@ -66,6 +67,12 @@ const MAX_CLAIM_TTL_MS: u64 = 60_000;
 /// one pass without affecting correctness. `DetectCycle.max_depth` is clamped to
 /// this rather than rejected.
 const MAX_CYCLE_DEPTH: u32 = 64;
+/// Owners scanned per `DumpLocks` page when the caller does not specify a size.
+const DEFAULT_DUMP_OWNER_PAGE: u32 = 64;
+/// Hard cap on owners scanned per `DumpLocks` page. Each owner is expanded in
+/// its own snapshot transaction, so a large page would pin a worker across many
+/// sequential round-trips; clients page instead.
+const MAX_DUMP_OWNER_PAGE: u32 = 512;
 
 #[allow(clippy::result_large_err)]
 fn check_id(label: &str, id: &str) -> Result<(), Status> {
@@ -201,6 +208,13 @@ fn to_mode(i: i32) -> Result<engine::Mode, Status> {
         Ok(proto::Mode::Read) => Ok(engine::Mode::Read),
         Ok(proto::Mode::Write) => Ok(engine::Mode::Write),
         Err(_) => Err(Status::invalid_argument(format!("invalid mode value {i}"))),
+    }
+}
+
+fn mode_to_proto(mode: engine::Mode) -> i32 {
+    match mode {
+        engine::Mode::Write => proto::Mode::Write as i32,
+        engine::Mode::Read => proto::Mode::Read as i32,
     }
 }
 
@@ -752,6 +766,114 @@ impl PathLock for PathLockService {
         .await
     }
 
+    // Read-only snapshot of the lock state at one exact path: live write owner,
+    // live read owners, fence value and any preemption claim. Filtered by owner
+    // liveness, never mutating — for operators and debugging tools.
+    async fn inspect_path(
+        &self,
+        request: Request<InspectPathRequest>,
+    ) -> Result<Response<InspectPathResponse>, Status> {
+        crate::otel::observe_rpc(
+            PATH_LOCK_SERVICE,
+            "InspectPath",
+            request,
+            |request| async move {
+                let req = request.into_inner();
+                check_path(&req.path)?;
+                let info = engine::inspect_path(&self.client, &req.path)
+                    .await
+                    .map_err(engine_err)?;
+                Ok(Response::new(InspectPathResponse {
+                    write_owner: info.write_owner.unwrap_or_default(),
+                    read_owners: info.read_owners,
+                    has_fence: info.fence.is_some(),
+                    fence: info.fence.unwrap_or(0),
+                    claim_owner: info.claim_owner.unwrap_or_default(),
+                }))
+            },
+        )
+        .await
+    }
+
+    // Read-only listing of every lock recorded for one owner, plus whether its
+    // liveness lease is still present. The companion to InspectPath's
+    // path-centric view: this is the owner-centric one.
+    async fn list_owner_locks(
+        &self,
+        request: Request<ListOwnerLocksRequest>,
+    ) -> Result<Response<ListOwnerLocksResponse>, Status> {
+        crate::otel::observe_rpc(
+            PATH_LOCK_SERVICE,
+            "ListOwnerLocks",
+            request,
+            |request| async move {
+                let req = request.into_inner();
+                check_id("owner_id", &req.owner_id)?;
+                let (alive, locks) = engine::list_owner_locks(&self.client, &req.owner_id)
+                    .await
+                    .map_err(engine_err)?;
+                Ok(Response::new(ListOwnerLocksResponse {
+                    alive,
+                    locks: locks
+                        .into_iter()
+                        .map(|l| OwnedLock {
+                            path: l.path,
+                            mode: mode_to_proto(l.mode),
+                        })
+                        .collect(),
+                }))
+            },
+        )
+        .await
+    }
+
+    // Cluster-wide, paginated dump of every live lock. Each entry is one
+    // (owner, mode, path) holding with the fence for write locks. Best-effort
+    // observability: clients page with the opaque cursor until done is true.
+    async fn dump_locks(
+        &self,
+        request: Request<DumpLocksRequest>,
+    ) -> Result<Response<DumpLocksResponse>, Status> {
+        crate::otel::observe_rpc(
+            PATH_LOCK_SERVICE,
+            "DumpLocks",
+            request,
+            |request| async move {
+                let req = request.into_inner();
+                let owner_page = if req.owner_page == 0 {
+                    DEFAULT_DUMP_OWNER_PAGE
+                } else {
+                    req.owner_page.min(MAX_DUMP_OWNER_PAGE)
+                };
+                let cursor = if req.cursor.is_empty() {
+                    None
+                } else {
+                    Some(req.cursor)
+                };
+                let page = engine::dump_locks(&self.client, cursor, owner_page)
+                    .await
+                    .map_err(engine_err)?;
+                let done = page.next_cursor.is_none();
+                Ok(Response::new(DumpLocksResponse {
+                    entries: page
+                        .entries
+                        .into_iter()
+                        .map(|e| LockEntry {
+                            owner: e.owner,
+                            path: e.path,
+                            mode: mode_to_proto(e.mode),
+                            has_fence: e.fence.is_some(),
+                            fence: e.fence.unwrap_or(0),
+                        })
+                        .collect(),
+                    next_cursor: page.next_cursor.unwrap_or_default(),
+                    done,
+                }))
+            },
+        )
+        .await
+    }
+
     type SubscribeStream = EventStream;
 
     // Open a per-owner event stream. The broadcaster routes only RELEASED,
@@ -943,6 +1065,18 @@ mod tests {
         );
 
         assert_eq!(status.code(), tonic::Code::ResourceExhausted);
+    }
+
+    #[test]
+    fn mode_to_proto_round_trips() {
+        for mode in [engine::Mode::Write, engine::Mode::Read] {
+            assert_eq!(to_mode(mode_to_proto(mode)).unwrap(), mode);
+        }
+        assert_eq!(
+            mode_to_proto(engine::Mode::Write),
+            proto::Mode::Write as i32
+        );
+        assert_eq!(mode_to_proto(engine::Mode::Read), proto::Mode::Read as i32);
     }
 
     #[test]

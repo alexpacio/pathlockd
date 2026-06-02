@@ -283,6 +283,87 @@ message PublishEventRequest {
 message PublishEventResponse {}
 
 // ---------------------------------------------------------------------------
+// Inspection (read-only observability)
+//
+// Pure point-in-time reads of lock state. Both filter by owner liveness so the
+// reported view matches what would actually block, but neither mutates: stale
+// dead-owner entries are left for active acquires and background GC to reclaim.
+// These exist for operators and debugging tools; the lock protocol itself never
+// needs them.
+// ---------------------------------------------------------------------------
+
+message InspectPathRequest {
+  // Path form "<handlerType>:<normalizedPath>", e.g. "google_drive:/a/b".
+  string path = 1;
+}
+
+message InspectPathResponse {
+  // Live write owner of this exact path, or empty if none holds it.
+  string write_owner = 1;
+  // Live read owners of this exact path. Reads are point-only, so this does not
+  // include readers of ancestors or descendants.
+  repeated string read_owners = 2;
+  // Whether a fencing token is currently persisted for this path. The fence can
+  // outlive the lock (its TTL is max(lease, 1 day)), so this may be true even
+  // when write_owner is empty.
+  bool has_fence = 3;
+  // The persisted fencing token. Meaningful only when has_fence is true.
+  int64 fence = 4;
+  // Live preemption claimant reserving this path for an in-flight revoke, or
+  // empty if none.
+  string claim_owner = 5;
+}
+
+message ListOwnerLocksRequest {
+  string owner_id = 1;
+}
+
+message OwnedLock {
+  string path = 1;
+  Mode mode = 2;
+}
+
+message ListOwnerLocksResponse {
+  // Whether the owner's liveness lease is currently present. When false the
+  // listed locks are tombstones an acquire/GC has not yet pruned.
+  bool alive = 1;
+  repeated OwnedLock locks = 2;
+}
+
+// A cluster-wide dump of every live lock, one (owner, mode, path) per entry.
+// Paged over the owner index; pass an empty cursor for the first page and the
+// returned next_cursor for each subsequent page until done is true. The dump is
+// best-effort (each owner is read in its own snapshot), so it is a near-real-time
+// view, not a single global instant.
+message DumpLocksRequest {
+  // Opaque pagination cursor. Empty for the first page; echo back the previous
+  // response's next_cursor to continue.
+  bytes cursor = 1;
+  // Owners to scan per page. 0 selects the server default; the server clamps to
+  // its maximum.
+  uint32 owner_page = 2;
+}
+
+message LockEntry {
+  string owner = 1;
+  string path = 2;
+  Mode mode = 3;
+  // Whether a fencing token is recorded for this path. Only ever true for write
+  // locks.
+  bool has_fence = 4;
+  // The fencing token; meaningful only when has_fence is true.
+  int64 fence = 5;
+}
+
+message DumpLocksResponse {
+  repeated LockEntry entries = 1;
+  // Opaque cursor for the next page; empty when done is true.
+  bytes next_cursor = 2;
+  // True once the scan has returned the final page.
+  bool done = 3;
+}
+
+// ---------------------------------------------------------------------------
 // Health
 // ---------------------------------------------------------------------------
 
@@ -307,6 +388,11 @@ service PathLock {
   rpc ClearWaitEdge(ClearWaitEdgeRequest) returns (ClearWaitEdgeResponse);
   rpc IsOwnerAlive(IsOwnerAliveRequest) returns (IsOwnerAliveResponse);
   rpc RequestRevoke(RequestRevokeRequest) returns (RequestRevokeResponse);
+
+  // Read-only inspection (operators / debugging tools).
+  rpc InspectPath(InspectPathRequest) returns (InspectPathResponse);
+  rpc ListOwnerLocks(ListOwnerLocksRequest) returns (ListOwnerLocksResponse);
+  rpc DumpLocks(DumpLocksRequest) returns (DumpLocksResponse);
   rpc Subscribe(SubscribeRequest) returns (stream Event);
   rpc Health(HealthRequest) returns (HealthResponse);
 
