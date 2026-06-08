@@ -8,7 +8,7 @@ use std::future::Future;
 use std::sync::OnceLock;
 use std::time::{Duration, Instant};
 
-use opentelemetry::metrics::{Counter, Histogram};
+use opentelemetry::metrics::{Counter, Gauge, Histogram};
 use opentelemetry::propagation::Extractor;
 use opentelemetry::trace::TracerProvider as _;
 use opentelemetry::{global, KeyValue};
@@ -163,6 +163,41 @@ pub fn record_gc_sweep(reclaimed: u64, elapsed: Duration, success: bool) {
             .record(elapsed.as_secs_f64() * 1000.0, &attrs);
         if reclaimed > 0 {
             metrics.gc_reclaimed.add(reclaimed, &attrs);
+        }
+    }
+}
+
+/// Record chunks the GC sweep skipped after a delete error (it continued past
+/// them). A non-zero value means orphaned/poisoned keys are being worked around;
+/// the stale-lock resolver and next sweep are the backstops.
+pub fn record_gc_skipped_chunks(n: u64) {
+    if n == 0 {
+        return;
+    }
+    if let Some(metrics) = METRICS.get() {
+        metrics.gc_skipped_chunks.add(n, &[]);
+    }
+}
+
+/// Record stranded transaction locks rolled back by the stale-lock resolver.
+pub fn record_stale_locks_resolved(n: u64) {
+    if n == 0 {
+        return;
+    }
+    if let Some(metrics) = METRICS.get() {
+        metrics.stale_locks_resolved.add(n, &[]);
+    }
+}
+
+/// Publish the live-lock census (sampled each logical GC sweep) as a per-class
+/// gauge. Every class is reported every call — including zeros — so a class that
+/// drains to empty reads as 0 instead of holding its last value.
+pub fn record_lock_census(census: &crate::store::LockCensus) {
+    if let Some(metrics) = METRICS.get() {
+        for (class, count) in census.class_counts() {
+            metrics
+                .live_locks
+                .record(count, &[KeyValue::new("class", class)]);
         }
     }
 }
@@ -353,6 +388,9 @@ struct Metrics {
     gc_sweeps: Counter<u64>,
     gc_reclaimed: Counter<u64>,
     gc_duration_ms: Histogram<f64>,
+    gc_skipped_chunks: Counter<u64>,
+    stale_locks_resolved: Counter<u64>,
+    live_locks: Gauge<u64>,
 }
 
 impl Metrics {
@@ -384,6 +422,22 @@ impl Metrics {
                 .f64_histogram("pathlockd.gc.duration")
                 .with_description("Storage GC sweep duration.")
                 .with_unit("ms")
+                .build(),
+            gc_skipped_chunks: meter
+                .u64_counter("pathlockd.gc.skipped_chunks")
+                .with_description("GC chunks skipped after a delete error; the sweep continued.")
+                .build(),
+            stale_locks_resolved: meter
+                .u64_counter("pathlockd.stale_lock.resolved")
+                .with_description(
+                    "Stranded transaction locks rolled back by the stale-lock resolver.",
+                )
+                .build(),
+            live_locks: meter
+                .u64_gauge("pathlockd.locks.live")
+                .with_description(
+                    "Live fslock keys by class (write/read/alive/owner/index/fence/wait/claim/other), sampled each logical GC sweep.",
+                )
                 .build(),
         }
     }

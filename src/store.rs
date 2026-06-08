@@ -926,7 +926,111 @@ async fn gc_delete_chunk(client: &TransactionClient, chunk: &[Vec<u8>]) -> anyho
     }
 }
 
-pub async fn gc_once(client: &TransactionClient, page: u32) -> anyhow::Result<u64> {
+/// Outcome of one [`gc_once`] sweep.
+#[derive(Debug, Clone, Copy, Default)]
+pub struct GcSweep {
+    /// Expired keys reclaimed this sweep.
+    pub reclaimed: u64,
+    /// Chunks skipped after a delete error (the sweep continued past them).
+    pub failed_chunks: u64,
+    /// Census of the *live* (non-expired) `fslock:` keys seen during the sweep,
+    /// broken down by class. Free to compute: the sweep already visits and
+    /// decodes every key, so the only added cost is classification.
+    pub census: LockCensus,
+}
+
+/// A by-class census of live `fslock:` keys, computed during the GC sweep.
+///
+/// This is the per-type "how many locks are held" view that TiKV's own
+/// per-column-family key counts cannot give (TiKV counts keys per CF, not per
+/// key-prefix). It counts only *non-expired* keys, so a lapsed-but-unswept lock
+/// drops out immediately rather than lingering until GC deletes it.
+#[derive(Debug, Clone, Copy, Default)]
+pub struct LockCensus {
+    /// `fslock:wr:*` — exclusive write locks.
+    pub write: u64,
+    /// Read-lock holdings: live members of `fslock:rd:*` sets.
+    pub read: u64,
+    /// `fslock:alive:*` — connected-owner liveness leases.
+    pub alive: u64,
+    /// Members of `fslock:own:*` owner sets (one per lock an owner holds).
+    pub owner_members: u64,
+    /// Members of the descendant indexes (`fslock:idx:*` sets).
+    pub index_members: u64,
+    /// `fslock:fence:*` fence tombstones (long-lived by design).
+    pub fence: u64,
+    /// `fslock:wait:*` wait-for edges.
+    pub wait: u64,
+    /// `fslock:claim:*` preemption reservations.
+    pub claim: u64,
+    /// Any other live `fslock:` key (e.g. the debug fencing counter).
+    pub other: u64,
+}
+
+impl LockCensus {
+    /// Classify one live key and bump the matching bucket.
+    fn record(&mut self, kb: &[u8]) {
+        if kb.starts_with(b"fslock:wr:") {
+            self.write += 1;
+        } else if kb.starts_with(b"fslock:alive:") {
+            self.alive += 1;
+        } else if kb.starts_with(b"fslock:fence:") {
+            self.fence += 1;
+        } else if kb.starts_with(b"fslock:wait:") {
+            self.wait += 1;
+        } else if kb.starts_with(b"fslock:claim:") {
+            self.claim += 1;
+        } else if kb.starts_with(SET_MEMBER_PREFIX.as_bytes()) {
+            // rd / own / idx sets all live under the unified setm prefix; recover
+            // just enough of the encoded set key to tell them apart.
+            match set_member_setkey_prefix(kb) {
+                Some(sk) if sk.starts_with(b"fslock:rd:") => self.read += 1,
+                Some(sk) if sk.starts_with(b"fslock:own:") => self.owner_members += 1,
+                Some(sk) if sk.starts_with(b"fslock:idx:") => self.index_members += 1,
+                _ => self.other += 1,
+            }
+        } else {
+            self.other += 1;
+        }
+    }
+
+    /// `(class, count)` pairs in a stable order, for metric emission. Always
+    /// includes every class (with zeros) so a drained class is reported as 0
+    /// rather than retaining a stale gauge value.
+    pub fn class_counts(&self) -> [(&'static str, u64); 9] {
+        [
+            ("write", self.write),
+            ("read", self.read),
+            ("alive", self.alive),
+            ("owner", self.owner_members),
+            ("index", self.index_members),
+            ("fence", self.fence),
+            ("wait", self.wait),
+            ("claim", self.claim),
+            ("other", self.other),
+        ]
+    }
+
+    pub fn total(&self) -> u64 {
+        self.class_counts().iter().map(|(_, n)| n).sum()
+    }
+}
+
+/// Decode just the leading bytes of the original set key from a
+/// `fslock:setm:<hex(setkey)>:<hex(member)>` key — enough to classify it
+/// (rd/own/idx) without hex-decoding a potentially long full key on the
+/// per-second GC path. Decodes at most `MAX` bytes (covers every set-key prefix).
+fn set_member_setkey_prefix(kb: &[u8]) -> Option<Vec<u8>> {
+    const MAX_BYTES: usize = 12;
+    let rest = kb.strip_prefix(SET_MEMBER_PREFIX.as_bytes())?;
+    let end = rest.iter().position(|&b| b == b':').unwrap_or(rest.len());
+    let hex = &rest[..end];
+    let take = (MAX_BYTES * 2).min(hex.len() & !1); // even count of hex chars
+    let hex = std::str::from_utf8(&hex[..take]).ok()?;
+    hex_decode(hex)
+}
+
+pub async fn gc_once(client: &TransactionClient, page: u32) -> anyhow::Result<GcSweep> {
     if page == 0 {
         anyhow::bail!("gc page must be > 0");
     }
@@ -936,6 +1040,7 @@ pub async fn gc_once(client: &TransactionClient, page: u32) -> anyhow::Result<u6
     let end: Vec<u8> = b"fslock;".to_vec(); // ':' + 1, exclusive upper bound of the prefix
     let mut deleted: u64 = 0;
     let mut failed_chunks: u64 = 0;
+    let mut census = LockCensus::default();
 
     loop {
         let pairs = gc_scan_page(client, &cursor, &end, page).await?;
@@ -952,6 +1057,8 @@ pub async fn gc_once(client: &TransactionClient, page: u32) -> anyhow::Result<u6
             if let Ok(s) = decode(p.value()) {
                 if expired(s.exp(), now) {
                     candidates.push(kb);
+                } else {
+                    census.record(&kb);
                 }
             }
         }
@@ -994,7 +1101,11 @@ pub async fn gc_once(client: &TransactionClient, page: u32) -> anyhow::Result<u6
         );
     }
 
-    Ok(deleted)
+    Ok(GcSweep {
+        reclaimed: deleted,
+        failed_chunks,
+        census,
+    })
 }
 
 fn mvcc_gc_safepoint(current: Timestamp, retention_ms: u64) -> Option<Timestamp> {
@@ -1467,5 +1578,34 @@ mod tests {
         assert_eq!(handler_of("local:/x"), "local");
         assert_eq!(handler_of("nocolon"), "nocolon");
         assert_eq!(handler_of(":/leading"), "");
+    }
+
+    #[test]
+    fn lock_census_classifies_keys() {
+        let mut c = LockCensus::default();
+        // Direct string keys.
+        c.record(wr_key("google_drive:/a/b").as_bytes());
+        c.record(alive_key("owner-1").as_bytes());
+        c.record(fence_key("google_drive:/a/b").as_bytes());
+        c.record(wait_key("owner-1").as_bytes());
+        c.record(claim_key("google_drive:/a").as_bytes());
+        // Set members live under the unified setm prefix; the original set key is
+        // hex-encoded inside, so classification must decode it back.
+        c.record(set_member_key(&rd_key("google_drive:/a/b"), "owner-2").as_bytes());
+        c.record(set_member_key(&own_key("owner-1"), "google_drive:/a/b|wr").as_bytes());
+        c.record(set_member_key(&wrdesc_key("google_drive:/a"), "google_drive:/a/b").as_bytes());
+        // A non-fslock-shaped key falls through to `other`.
+        c.record(FENCING_COUNTER_KEY.as_bytes());
+
+        assert_eq!(c.write, 1);
+        assert_eq!(c.alive, 1);
+        assert_eq!(c.fence, 1);
+        assert_eq!(c.wait, 1);
+        assert_eq!(c.claim, 1);
+        assert_eq!(c.read, 1);
+        assert_eq!(c.owner_members, 1);
+        assert_eq!(c.index_members, 1);
+        assert_eq!(c.other, 1);
+        assert_eq!(c.total(), 9);
     }
 }

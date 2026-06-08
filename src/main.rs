@@ -190,12 +190,15 @@ async fn logical_gc_pass(client: &TransactionClient, instance_id: &str, page: u3
 
     let started = Instant::now();
     match store::gc_once(client, page).await {
-        Ok(n) if n > 0 => {
-            otel::record_gc_sweep(n, started.elapsed(), true);
-            info!(reclaimed = n, "gc sweep");
-        }
-        Ok(_) => {
-            otel::record_gc_sweep(0, started.elapsed(), true);
+        Ok(sweep) => {
+            otel::record_gc_sweep(sweep.reclaimed, started.elapsed(), true);
+            otel::record_gc_skipped_chunks(sweep.failed_chunks);
+            // The sweep already visited every live key; publish the per-class
+            // census it produced as a side effect.
+            otel::record_lock_census(&sweep.census);
+            if sweep.reclaimed > 0 {
+                info!(reclaimed = sweep.reclaimed, "gc sweep");
+            }
         }
         Err(e) => {
             otel::record_gc_sweep(0, started.elapsed(), false);
@@ -293,6 +296,7 @@ async fn stale_lock_resolve_pass(client: &TransactionClient, instance_id: &str, 
     let started = Instant::now();
     match store::resolve_stale_locks(client, grace_ms).await {
         Ok(resolved) if resolved > 0 => {
+            otel::record_stale_locks_resolved(resolved as u64);
             warn!(
                 resolved,
                 grace_ms,
