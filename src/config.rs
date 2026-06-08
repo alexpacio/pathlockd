@@ -14,6 +14,8 @@
 //! gc_page          = 256
 //! mvcc_gc_interval_secs = 300
 //! mvcc_gc_safe_point_retention_secs = 600
+//! stale_lock_resolve_interval_secs = 10
+//! stale_lock_grace_secs = 60
 //! event_buffer     = 8192
 //! request_timeout_ms = 30000
 //! max_concurrent_requests_per_connection = 256
@@ -43,6 +45,14 @@ pub struct Config {
     pub mvcc_gc_interval_secs: u64,
     /// How far behind PD's current timestamp TiKV MVCC GC may advance.
     pub mvcc_gc_safe_point_retention_secs: u64,
+    /// Interval for the stale-lock resolver, which rolls back transaction locks
+    /// orphaned by a crashed/abandoned commit before MVCC GC's much larger
+    /// retention window would (0 disables).
+    pub stale_lock_resolve_interval_secs: u64,
+    /// A lock older than this is treated as stranded and resolved. Must comfortably
+    /// exceed the longest legitimate transaction, so it is not set below the
+    /// request timeout.
+    pub stale_lock_grace_secs: u64,
     /// Per-subscriber event queue depth. Each `Subscribe` stream gets its own
     /// bounded queue of this size carrying only its owner's events; an overflow
     /// drops (the client recheck is the backstop).
@@ -66,6 +76,8 @@ impl Default for Config {
             gc_page: 1024,
             mvcc_gc_interval_secs: 300,
             mvcc_gc_safe_point_retention_secs: 600,
+            stale_lock_resolve_interval_secs: 10,
+            stale_lock_grace_secs: 60,
             event_buffer: 8192,
             peers: Vec::new(),
             request_timeout_ms: 30_000,
@@ -84,6 +96,8 @@ struct FileConfig {
     gc_page: Option<u32>,
     mvcc_gc_interval_secs: Option<u64>,
     mvcc_gc_safe_point_retention_secs: Option<u64>,
+    stale_lock_resolve_interval_secs: Option<u64>,
+    stale_lock_grace_secs: Option<u64>,
     event_buffer: Option<usize>,
     peers: Option<Vec<String>>,
     request_timeout_ms: Option<u64>,
@@ -142,6 +156,12 @@ impl Config {
             if let Some(v) = file.mvcc_gc_safe_point_retention_secs {
                 cfg.mvcc_gc_safe_point_retention_secs = v;
             }
+            if let Some(v) = file.stale_lock_resolve_interval_secs {
+                cfg.stale_lock_resolve_interval_secs = v;
+            }
+            if let Some(v) = file.stale_lock_grace_secs {
+                cfg.stale_lock_grace_secs = v;
+            }
             if let Some(v) = file.event_buffer {
                 cfg.event_buffer = v;
             }
@@ -177,6 +197,12 @@ impl Config {
         }
         if let Some(v) = env_parse::<u64>("PATHLOCKD_MVCC_GC_SAFE_POINT_RETENTION_SECS")? {
             cfg.mvcc_gc_safe_point_retention_secs = v;
+        }
+        if let Some(v) = env_parse::<u64>("PATHLOCKD_STALE_LOCK_RESOLVE_INTERVAL_SECS")? {
+            cfg.stale_lock_resolve_interval_secs = v;
+        }
+        if let Some(v) = env_parse::<u64>("PATHLOCKD_STALE_LOCK_GRACE_SECS")? {
+            cfg.stale_lock_grace_secs = v;
         }
         if let Some(v) = env_parse::<usize>("PATHLOCKD_EVENT_BUFFER")? {
             cfg.event_buffer = v;
@@ -228,6 +254,18 @@ impl Config {
             if retention_ms < cfg.request_timeout_ms.saturating_mul(2) {
                 anyhow::bail!(
                     "mvcc_gc_safe_point_retention_secs must be at least 2x request_timeout_ms"
+                );
+            }
+        }
+        if cfg.stale_lock_resolve_interval_secs > 0 {
+            // Resolving a lock younger than the request timeout could roll back a
+            // legitimately in-flight transaction, so the grace window must clear
+            // it with margin.
+            let grace_ms = cfg.stale_lock_grace_secs.saturating_mul(1000);
+            if grace_ms < cfg.request_timeout_ms {
+                anyhow::bail!(
+                    "stale_lock_grace_secs must be at least request_timeout_ms (={} ms) when the stale-lock resolver is enabled",
+                    cfg.request_timeout_ms
                 );
             }
         }

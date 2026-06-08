@@ -41,6 +41,8 @@ async fn main() -> anyhow::Result<()> {
         gc_interval_secs = cfg.gc_interval_secs,
         mvcc_gc_interval_secs = cfg.mvcc_gc_interval_secs,
         mvcc_gc_safe_point_retention_secs = cfg.mvcc_gc_safe_point_retention_secs,
+        stale_lock_resolve_interval_secs = cfg.stale_lock_resolve_interval_secs,
+        stale_lock_grace_secs = cfg.stale_lock_grace_secs,
         request_timeout_ms = cfg.request_timeout_ms,
         max_concurrent_requests_per_connection = cfg.max_concurrent_requests_per_connection,
         otel_traces = telemetry.traces_enabled(),
@@ -70,6 +72,14 @@ async fn main() -> anyhow::Result<()> {
             instance_id.clone(),
             cfg.mvcc_gc_interval_secs,
             cfg.mvcc_gc_safe_point_retention_secs.saturating_mul(1000),
+        );
+    }
+    if cfg.stale_lock_resolve_interval_secs > 0 {
+        spawn_stale_lock_resolver(
+            client.clone(),
+            instance_id.clone(),
+            cfg.stale_lock_resolve_interval_secs,
+            cfg.stale_lock_grace_secs.saturating_mul(1000),
         );
     }
 
@@ -240,6 +250,59 @@ async fn mvcc_gc_pass(client: &TransactionClient, instance_id: &str, retention_m
         }
         Err(e) => {
             error!(error = %e, "tikv mvcc gc sweep failed");
+        }
+    }
+}
+
+fn spawn_stale_lock_resolver(
+    client: Arc<TransactionClient>,
+    instance_id: String,
+    interval_secs: u64,
+    grace_ms: u64,
+) {
+    tokio::spawn(async move {
+        let mut tick = tokio::time::interval(Duration::from_secs(interval_secs));
+        tick.set_missed_tick_behavior(tokio::time::MissedTickBehavior::Delay);
+        tick.tick().await; // consume the immediate first tick
+        loop {
+            tick.tick().await;
+            run_background_step(
+                "stale lock resolve",
+                stale_lock_resolve_pass(&client, &instance_id, grace_ms),
+            )
+            .await;
+        }
+    });
+}
+
+async fn stale_lock_resolve_pass(client: &TransactionClient, instance_id: &str, grace_ms: u64) {
+    match store::try_acquire_gc_lease(client, "stale-lock", instance_id, GC_COORDINATION_LEASE_MS)
+        .await
+    {
+        Ok(true) => {}
+        Ok(false) => {
+            debug!("stale lock resolve skipped; another replica holds the lease");
+            return;
+        }
+        Err(e) => {
+            error!(error = %e, "stale lock resolve lease acquisition failed");
+            return;
+        }
+    }
+
+    let started = Instant::now();
+    match store::resolve_stale_locks(client, grace_ms).await {
+        Ok(resolved) if resolved > 0 => {
+            warn!(
+                resolved,
+                grace_ms,
+                elapsed_ms = started.elapsed().as_secs_f64() * 1000.0,
+                "stale lock resolve sweep reclaimed orphaned locks"
+            );
+        }
+        Ok(_) => {}
+        Err(e) => {
+            error!(error = %e, "stale lock resolve sweep failed");
         }
     }
 }

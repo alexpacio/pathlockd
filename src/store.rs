@@ -37,6 +37,7 @@ use std::collections::{BTreeMap, HashSet};
 use std::time::{SystemTime, UNIX_EPOCH};
 
 use serde::{Deserialize, Serialize};
+use tikv_client::transaction::{HeartbeatOption, ResolveLocksOptions};
 use tikv_client::{CheckLevel, Key, Timestamp, Transaction, TransactionClient, TransactionOptions};
 
 /// Shared key prefix for all lock metadata.
@@ -374,7 +375,21 @@ impl Tx {
         // CheckLevel::Warn (not the default Panic): a transaction that is dropped
         // without an explicit commit/rollback — e.g. when a `?` short-circuits a
         // begin, or a future is cancelled — must never crash the daemon.
-        let opts = TransactionOptions::new_optimistic().drop_check(CheckLevel::Warn);
+        //
+        // NoHeartbeat bounds the blast radius of a transaction that is abandoned
+        // mid-2PC (a daemon crash, or a commit future dropped before it finishes).
+        // An optimistic transaction *does* leave prewrite locks on its keys during
+        // commit; with auto-heartbeat those locks are kept alive (TTL bumped to
+        // ~20s every 10s) until the dropped transaction's status flips, so an
+        // abandoned commit can pin resolved-ts and stall GC for the whole region
+        // for ~30s. Without heartbeat the prewrite lock keeps its initial
+        // `DEFAULT_LOCK_TTL` (~3s) and expires on its own, after which TiKV's lock
+        // resolver rolls it back. Our transactions are short (a handful of
+        // sequential point ops), so they commit well within that TTL; a rare slow
+        // one whose lock lapses simply retries via `txn_retry!`.
+        let opts = TransactionOptions::new_optimistic()
+            .drop_check(CheckLevel::Warn)
+            .heartbeat_option(HeartbeatOption::NoHeartbeat);
         let mut txn = client.begin_with_options(opts).await?;
         let now = match cluster_now_ms(client).await {
             Ok(now) => now,
@@ -759,12 +774,16 @@ impl Tx {
 }
 
 /// Begin a bare optimistic transaction with `CheckLevel::Warn` so a drop during
-/// runtime teardown / future cancellation warns instead of crashing. (Optimistic
-/// transactions hold no locks and buffer mutations locally, so an abandoned one
-/// has no durable effect.)
+/// runtime teardown / future cancellation warns instead of crashing, and with
+/// auto-heartbeat disabled so any prewrite lock a dropped commit leaves behind
+/// expires on its own short TTL instead of being kept alive (see [`Tx::begin`]).
 async fn begin_warn(client: &TransactionClient) -> anyhow::Result<Transaction> {
     Ok(client
-        .begin_with_options(TransactionOptions::new_optimistic().drop_check(CheckLevel::Warn))
+        .begin_with_options(
+            TransactionOptions::new_optimistic()
+                .drop_check(CheckLevel::Warn)
+                .heartbeat_option(HeartbeatOption::NoHeartbeat),
+        )
         .await?)
 }
 
@@ -916,6 +935,7 @@ pub async fn gc_once(client: &TransactionClient, page: u32) -> anyhow::Result<u6
     let mut cursor: Vec<u8> = PREFIX.as_bytes().to_vec();
     let end: Vec<u8> = b"fslock;".to_vec(); // ':' + 1, exclusive upper bound of the prefix
     let mut deleted: u64 = 0;
+    let mut failed_chunks: u64 = 0;
 
     loop {
         let pairs = gc_scan_page(client, &cursor, &end, page).await?;
@@ -938,8 +958,25 @@ pub async fn gc_once(client: &TransactionClient, page: u32) -> anyhow::Result<u6
 
         // Delete this page's expired keys under a fresh re-check so a key a
         // concurrent refresh re-wrote is never reclaimed.
+        //
+        // A single poisoned chunk must not abort the whole sweep: if it did, one
+        // stuck key (e.g. a key still pinned by an orphaned prewrite lock whose
+        // primary txn record is gone, which surfaces as `TxnNotFound` during the
+        // commit's lock resolution) would stall GC for the *entire* keyspace.
+        // Skip the chunk and keep going; the stale-lock resolver and the next
+        // sweep are the backstops for whatever it left behind.
         for chunk in candidates.chunks(256) {
-            deleted += gc_delete_chunk(client, chunk).await?;
+            match gc_delete_chunk(client, chunk).await {
+                Ok(n) => deleted += n,
+                Err(e) => {
+                    failed_chunks += 1;
+                    tracing::warn!(
+                        error = %e,
+                        chunk_keys = chunk.len(),
+                        "gc chunk failed; skipping and continuing sweep"
+                    );
+                }
+            }
         }
 
         if got < page as usize {
@@ -947,6 +984,14 @@ pub async fn gc_once(client: &TransactionClient, page: u32) -> anyhow::Result<u6
         }
         cursor = last_key;
         cursor.push(0);
+    }
+
+    if failed_chunks > 0 {
+        tracing::warn!(
+            failed_chunks,
+            reclaimed = deleted,
+            "gc sweep completed with skipped chunks"
+        );
     }
 
     Ok(deleted)
@@ -994,6 +1039,62 @@ pub async fn mvcc_gc_once(
             }
         }
     }
+}
+
+/// Batch size for the stale-lock scan. Must be >= the number of locks expected
+/// in one region scan; the resolver pages internally, so this only bounds one
+/// scan RPC's response.
+const STALE_LOCK_SCAN_BATCH: u32 = 1024;
+
+/// Actively resolve stranded transaction locks across the `fslock:` range.
+///
+/// [`mvcc_gc_once`] already resolves locks below its safepoint, but that window
+/// is sized for MVCC retention (minutes), so a lock orphaned by a crashed or
+/// abandoned commit lingers far longer than it should — pinning resolved-ts and
+/// failing GC chunks ([`gc_once`]) the whole time. This sweep targets exactly
+/// those: it scans the lock range for locks older than `stale_after_ms` and asks
+/// TiKV to resolve them. A genuinely live transaction's lock is younger than the
+/// threshold (our transactions are short and run heartbeat-less, so a real lock
+/// only lives ~3s) and, even if scanned, is left untouched while it remains
+/// unexpired; only an *expired* orphan is rolled back (`rollback_if_not_exist`),
+/// which is precisely the `TxnNotFound` case that used to wedge the cluster.
+///
+/// Returns the number of locks resolved.
+pub async fn resolve_stale_locks(
+    client: &TransactionClient,
+    stale_after_ms: u64,
+) -> anyhow::Result<usize> {
+    if stale_after_ms == 0 {
+        anyhow::bail!("stale lock resolve threshold must be > 0");
+    }
+
+    let current = client.current_timestamp().await?;
+    let Some(safepoint) = mvcc_gc_safepoint(current, stale_after_ms) else {
+        // Cluster clock not yet past the threshold (fresh cluster); nothing old
+        // enough to be considered stranded.
+        return Ok(0);
+    };
+
+    let start = Key::from(PREFIX.as_bytes().to_vec());
+    let end = Key::from(b"fslock;".to_vec());
+    let options = ResolveLocksOptions {
+        batch_size: STALE_LOCK_SCAN_BATCH,
+        ..Default::default()
+    };
+
+    let result = client.cleanup_locks(start..end, &safepoint, options).await?;
+    if let Some(errors) = result.key_error.filter(|e| !e.is_empty()) {
+        // Per-lock errors are non-fatal: a lock that could not be resolved this
+        // pass (e.g. it just got committed, or is still within its TTL) is simply
+        // retried next pass. Surface them for visibility without failing the run.
+        tracing::warn!(
+            error_count = errors.len(),
+            sample = %errors[0],
+            resolved = result.resolved_locks,
+            "stale-lock resolve hit per-lock errors; continuing"
+        );
+    }
+    Ok(result.resolved_locks)
 }
 
 /// Try to acquire or refresh a cluster-wide background-job lease.

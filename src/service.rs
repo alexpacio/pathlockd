@@ -46,6 +46,33 @@ fn engine_err(e: anyhow::Error) -> Status {
     }
 }
 
+/// Run a state-mutating engine operation detached from the request future.
+///
+/// tonic cancels a handler future on the request timeout or a client disconnect.
+/// If that cancellation lands inside `Tx::commit`, the optimistic transaction is
+/// dropped mid-2PC and TiKV keeps the prewrite lock it had already placed —
+/// which stalls resolved-ts and GC for the whole region until the lock TTL
+/// lapses. Spawning the work onto the runtime decouples it from the request: the
+/// transaction always runs to a terminal commit or rollback, and only the
+/// *response* is lost on cancellation. Every mutating RPC here is idempotent
+/// under the client's retry, so a lost OK is harmless.
+async fn run_detached<T>(
+    op: impl std::future::Future<Output = anyhow::Result<T>> + Send + 'static,
+) -> Result<T, Status>
+where
+    T: Send + 'static,
+{
+    // We only ever drop the JoinHandle (never call `.abort()`), so the spawned
+    // task is never cancelled; a JoinError therefore means it panicked.
+    match tokio::spawn(op).await {
+        Ok(res) => res.map_err(engine_err),
+        Err(join_err) => {
+            tracing::error!(error = %join_err, "mutating operation panicked");
+            Err(Status::internal("internal error"))
+        }
+    }
+}
+
 // --- request validation (defensive backstop; clients are expected to send
 // already-normalized paths and sane leases) ---
 
@@ -320,9 +347,9 @@ impl PathLock for PathLockService {
                     release_requests,
                 };
 
-                let outcome = engine::acquire(&self.client, args)
-                    .await
-                    .map_err(engine_err)?;
+                let client = self.client.clone();
+                let outcome = run_detached(async move { engine::acquire(&client, args).await })
+                    .await?;
                 let resp = match outcome {
                     AcquireOutcome::Ok => {
                         // RELEASED is published only when an inline release actually ran and
@@ -391,9 +418,13 @@ impl PathLock for PathLockService {
                         })
                     })
                     .collect::<Result<_, Status>>()?;
-                engine::release(&self.client, &req.owner_id, &reqs, req.del_wait_key)
-                    .await
-                    .map_err(engine_err)?;
+                let client = self.client.clone();
+                let owner_id = req.owner_id.clone();
+                let del_wait_key = req.del_wait_key;
+                run_detached(async move {
+                    engine::release(&client, &owner_id, &reqs, del_wait_key).await
+                })
+                .await?;
                 // Release always publishes RELEASED for the owner.
                 self.broadcaster.released(&req.owner_id);
                 Ok(Response::new(ReleaseResponse {}))
@@ -416,9 +447,13 @@ impl PathLock for PathLockService {
             |request| async move {
                 let req = request.into_inner();
                 check_id("owner_id", &req.owner_id)?;
-                engine::release_all(&self.client, &req.owner_id, req.del_wait_key)
-                    .await
-                    .map_err(engine_err)?;
+                let client = self.client.clone();
+                let owner_id = req.owner_id.clone();
+                let del_wait_key = req.del_wait_key;
+                run_detached(async move {
+                    engine::release_all(&client, &owner_id, del_wait_key).await
+                })
+                .await?;
                 self.broadcaster.released(&req.owner_id);
                 Ok(Response::new(ReleaseResponse {}))
             },
@@ -437,9 +472,11 @@ impl PathLock for PathLockService {
             let req = request.into_inner();
             check_id("owner_id", &req.owner_id)?;
             check_ttl(req.ttl_ms)?;
-            let outcome = engine::renew(&self.client, &req.owner_id, req.ttl_ms)
-                .await
-                .map_err(engine_err)?;
+            let client = self.client.clone();
+            let owner_id = req.owner_id.clone();
+            let ttl_ms = req.ttl_ms;
+            let outcome =
+                run_detached(async move { engine::renew(&client, &owner_id, ttl_ms).await }).await?;
             let resp = match outcome {
                 RenewOutcome::Ok => RenewResponse {
                     status: RenewStatus::Ok as i32,
@@ -470,9 +507,10 @@ impl PathLock for PathLockService {
             |request| async move {
                 let req = request.into_inner();
                 check_id("victim_id", &req.victim_id)?;
-                engine::force_release(&self.client, &req.victim_id)
-                    .await
-                    .map_err(engine_err)?;
+                let client = self.client.clone();
+                let victim_id = req.victim_id.clone();
+                run_detached(async move { engine::force_release(&client, &victim_id).await })
+                    .await?;
                 self.broadcaster.killed(&req.victim_id);
                 Ok(Response::new(ForceReleaseResponse {}))
             },
@@ -505,14 +543,14 @@ impl PathLock for PathLockService {
                 if !req.paths.is_empty() {
                     check_write_fencing_token(req.fencing_token)?;
                 }
-                let outcome = engine::assert_fencing(
-                    &self.client,
-                    &req.owner_id,
-                    req.fencing_token,
-                    &req.paths,
-                )
-                .await
-                .map_err(engine_err)?;
+                let client = self.client.clone();
+                let owner_id = req.owner_id.clone();
+                let fencing_token = req.fencing_token;
+                let paths = req.paths.clone();
+                let outcome = run_detached(async move {
+                    engine::assert_fencing(&client, &owner_id, fencing_token, &paths).await
+                })
+                .await?;
                 let resp = match outcome {
                     AssertOutcome::Ok => AssertFencingResponse {
                         status: AssertStatus::Ok as i32,
@@ -545,9 +583,12 @@ impl PathLock for PathLockService {
                 let req = request.into_inner();
                 check_id("start_owner_id", &req.start_owner_id)?;
                 let depth = req.max_depth.min(MAX_CYCLE_DEPTH);
-                let outcome = engine::detect_cycle(&self.client, &req.start_owner_id, depth)
-                    .await
-                    .map_err(engine_err)?;
+                let client = self.client.clone();
+                let start_owner_id = req.start_owner_id.clone();
+                let outcome = run_detached(async move {
+                    engine::detect_cycle(&client, &start_owner_id, depth).await
+                })
+                .await?;
                 let resp = match outcome {
                     CycleOutcome::None => DetectCycleResponse {
                         kind: CycleKind::None as i32,
@@ -584,14 +625,14 @@ impl PathLock for PathLockService {
                 check_path(&req.conflict_path)?;
                 check_id("conflict_owner", &req.conflict_owner)?;
                 check_blocking_reason(&req.reason)?;
-                let blocking = engine::is_blocking(
-                    &self.client,
-                    &req.conflict_path,
-                    &req.conflict_owner,
-                    &req.reason,
-                )
-                .await
-                .map_err(engine_err)?;
+                let client = self.client.clone();
+                let conflict_path = req.conflict_path.clone();
+                let conflict_owner = req.conflict_owner.clone();
+                let reason = req.reason.clone();
+                let blocking = run_detached(async move {
+                    engine::is_blocking(&client, &conflict_path, &conflict_owner, &reason).await
+                })
+                .await?;
                 Ok(Response::new(IsBlockingResponse { blocking }))
             },
         )
@@ -648,15 +689,21 @@ impl PathLock for PathLockService {
                         reason: req.reason,
                     })
                 };
-                engine::set_wait_edge(
-                    &self.client,
-                    &req.owner_id,
-                    &req.conflict_owner,
-                    req.ttl_ms,
-                    metadata.as_ref(),
-                )
-                .await
-                .map_err(engine_err)?;
+                let client = self.client.clone();
+                let owner_id = req.owner_id.clone();
+                let conflict_owner = req.conflict_owner.clone();
+                let ttl_ms = req.ttl_ms;
+                run_detached(async move {
+                    engine::set_wait_edge(
+                        &client,
+                        &owner_id,
+                        &conflict_owner,
+                        ttl_ms,
+                        metadata.as_ref(),
+                    )
+                    .await
+                })
+                .await?;
                 Ok(Response::new(SetWaitEdgeResponse {}))
             },
         )
@@ -676,9 +723,10 @@ impl PathLock for PathLockService {
             |request| async move {
                 let req = request.into_inner();
                 check_id("owner_id", &req.owner_id)?;
-                engine::clear_wait_edge(&self.client, &req.owner_id)
-                    .await
-                    .map_err(engine_err)?;
+                let client = self.client.clone();
+                let owner_id = req.owner_id.clone();
+                run_detached(async move { engine::clear_wait_edge(&client, &owner_id).await })
+                    .await?;
                 Ok(Response::new(ClearWaitEdgeResponse {}))
             },
         )
@@ -742,14 +790,16 @@ impl PathLock for PathLockService {
                     "claim_ttl_ms too large (max {MAX_CLAIM_TTL_MS} ms; use 0 for the default)"
                 )));
                     }
-                    if let Err(e) = engine::set_claim(
-                        &self.client,
-                        &req.claim_path,
-                        &req.claimant_owner_id,
-                        req.claim_ttl_ms,
-                    )
-                    .await
-                    {
+                    let client = self.client.clone();
+                    let claim_path = req.claim_path.clone();
+                    let claimant_owner_id = req.claimant_owner_id.clone();
+                    let claim_ttl_ms = req.claim_ttl_ms;
+                    let claim_res = run_detached(async move {
+                        engine::set_claim(&client, &claim_path, &claimant_owner_id, claim_ttl_ms)
+                            .await
+                    })
+                    .await;
+                    if let Err(e) = claim_res {
                         tracing::warn!(
                             owner_id = %req.owner_id,
                             claim_path = %req.claim_path,
