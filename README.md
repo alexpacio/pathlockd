@@ -5,18 +5,18 @@
 <h1 align="center">pathlockd</h1>
 
 <p align="center">
-  <em>Pathlockd provides fast, scalable, opinionated path-based distributed
-  locking primitives for developers building user-space virtual filesystems,
-  persisting lock metadata in TiKV.</em>
+  <em>Fast, scalable, opinionated path-based distributed locking primitives
+  with embedded Multi-Raft and RocksDB, exposed over gRPC.</em>
 </p>
 
 ---
 
-`pathlockd` is a daemon that coordinates concurrent access to a **hierarchical
-path namespace** (`handler:/a/b/c`) across many processes and machines. It
-exposes a small, precise set of locking primitives over **gRPC** and keeps all
-durable state in a **TiKV** cluster, so it is horizontally scalable, resilient,
-and highly available with no single point of failure.
+`pathlockd` is a **self-contained** daemon that coordinates concurrent access to
+a **hierarchical path namespace** (`handler:/a/b/c`) across many processes and
+machines. It exposes a small, precise set of locking primitives over **gRPC** and
+stores all durable state in an embedded **RocksDB** engine with **Multi-Raft**
+consensus, so it is horizontally scalable, resilient, and highly available —
+with no external dependencies.
 
 It is *opinionated*: the locking model is exactly the one a virtual-filesystem
 needs — write locks that cover a whole subtree, point reads that don't, fencing
@@ -71,41 +71,44 @@ pathlockd enforces this containment directly, with O(subtree) conflict checks
         │  gRPC
         ▼
    ┌─────────────┐   ┌─────────────┐   ┌─────────────┐
-   │  pathlockd  │   │  pathlockd  │   │  pathlockd  │   stateless, N replicas
+   │  pathlockd  │   │  pathlockd  │   │  pathlockd  │   N replicas (gossip)
    └──────┬──────┘   └──────┬──────┘   └──────┬──────┘
           └─────────────────┼─────────────────┘
                             ▼
                     ┌───────────────┐
-                    │  TiKV + PD    │   Raft-replicated, HA, scalable
+                    │  RocksDB      │   embedded, per-node
+                    │  + Multi-Raft │   Raft-replicated, HA
                     └───────────────┘
 ```
 
-- **Stateless daemon.** All durable state lives in TiKV, so any `pathlockd`
-  replica can serve any request; add or remove replicas freely and do rolling
-  restarts without losing locks.
-- **TiKV for persistence.** Lock metadata is Raft-replicated across nodes,
-  survives node loss, and scales horizontally as you add TiKV nodes (PD
-  rebalances regions). There is no single Redis-style SPOF.
-- **Atomicity.** Each multi-key operation runs as one optimistic TiKV
-  transaction that writes a **per-handler** serialization tombstone, so any two
-  overlapping mutations *on the same handler* conflict at commit and one retries
-  — giving single-threaded correctness within a handler while letting disjoint
-  handlers commit in parallel, without accumulating live marker keys.
-  Containment hazards never cross handlers, so this is sufficient. Read-mostly
-  and advisory checks (`AssertFencing`, `IsBlocking`, `DetectCycle`) run
-  lock-free.
-- **TTL is emulated** on top of TiKV: writes stamp an absolute expiry; reads
-  treat elapsed entries as absent (correctness), and a background sweep reclaims
-  them (housekeeping, runs every second by default). Set entries (read sets,
-  descendant indexes) expire **per member**, so a short-lived lock can never
-  shorten the visibility of a longer-lived one sharing the same key.
+- **Self-contained binary.** All durable state lives in an embedded RocksDB
+  engine inside each node. No external coordination service is needed — start
+  a single binary and it is ready.
+- **RocksDB for persistence.** Lock metadata is stored in 14 column families
+  with TTL-based expiry and background GC sweeps. WAL fsync guarantees
+  durability across process crashes.
+- **Multi-Raft consensus.** State-machine commands (acquire, release, renew,
+  force-release, set-claim, set-wait-edge, incr-fence, GC sweeps) are applied
+  through a serialized write path backed by RocksDB WriteBatch. The engine
+  functions are deterministic and synchronous — identical on every replica.
+- **Atomicity.** Each mutating operation runs inside a single WriteBatch
+  applied atomically. A global apply lock guarantees read-modify-write
+  serialization, giving single-threaded correctness within a handler domain
+  while letting disjoint handlers commit in parallel. Read-only and advisory
+  checks (`AssertFencing`, `IsBlocking`, `DetectCycle`) read from a direct
+  RocksDB snapshot.
+- **TTL-based leases.** Every record carries an absolute expiry timestamp.
+  Reads treat elapsed entries as absent (correctness); a background GC sweep
+  reclaims expired records (housekeeping, configurable interval). Set entries
+  (read sets, descendant indexes) expire **per member**, so a short-lived lock
+  never shortens the visibility of a longer-lived one sharing the same key.
 
 ### Scope & limits
 
 - **Write throughput scales per handler, not without bound.** All mutations that
-  touch a given handler serialize through that handler's key (one TiKV region /
-  Raft leader). Spread load across handlers — or split a hot handler — to scale;
-  a single hot handler is the throughput ceiling.
+  touch a given handler serialize through the handler's Raft group leader.
+  Spread load across handlers — or split a hot handler — to scale; a single hot
+  handler is the throughput ceiling.
 - **Descendant index size.** A write lock is indexed under every ancestor up to
   the handler root, so the root index aggregates every write lock in the handler
   in one value. This bounds the practical number of concurrent locks per handler;
@@ -129,8 +132,8 @@ release:
 - [ ] **Prometheus scrape endpoint** — OTLP tracing/metrics export is available;
   a local `/metrics` endpoint is not yet exposed.
 - [ ] **CI** — no continuous-integration pipeline yet (build, clippy, unit +
-  integration tests against an ephemeral TiKV on every push/PR). Container
-  images are published via [`.github/workflows/docker-publish.yml`](.github/workflows/docker-publish.yml)
+  engine tests on every push/PR). Container images are published via
+  [`.github/workflows/docker-publish.yml`](.github/workflows/docker-publish.yml)
   on every `v*` tag.
 - [ ] **Authentication & authorization, TLS** — the gRPC surface is currently
   unauthenticated and in plaintext; until then, run pathlockd only on a trusted
@@ -160,36 +163,29 @@ Pre-built images are published to GHCR on every version tag (`v*`):
 
 | Image tag | Binary | Notes |
 | --- | --- | --- |
-| `ghcr.io/alexpacio/pathlockd:0.2.2` | x86-64-v3 (amd64) / native (arm64) | requires x86-64-v3 or newer on amd64 (Haswell+, ≈2015+) |
+| `ghcr.io/alexpacio/pathlockd:0.6.0` | x86-64-v3 (amd64) / native (arm64) | requires x86-64-v3 or newer on amd64 (Haswell+, ≈2015+) |
 
-**Dependency — TiKV cluster.** pathlockd stores all state in TiKV and needs
-one or more PD (Placement Driver) endpoints. For a local playground a
-single-node cluster is enough:
-
-```bash
-# start a single-node TiKV + PD (playground only — not HA)
-docker run -d --name pd -p 2379:2379 pingcap/pd:latest \
-  --client-urls=http://0.0.0.0:2379 --advertise-client-urls=http://127.0.0.1:2379
-docker run -d --name tikv --network=container:pd pingcap/tikv:latest \
-  --pd-endpoints=127.0.0.1:2379
-```
-
-**Run pathlockd:**
+**Run pathlockd** (single node, no external dependencies):
 
 ```bash
 docker run -d --restart=unless-stopped \
   -p 50051:50051 \
-  -e PATHLOCKD_PD_ENDPOINTS="127.0.0.1:2379" \
-  ghcr.io/alexpacio/pathlockd:0.2.2
+  -e PATHLOCKD_BOOTSTRAP=true \
+  -e PATHLOCKD_DATA_DIR=/data/pathlockd \
+  -v pathlockd-data:/data/pathlockd \
+  ghcr.io/alexpacio/pathlockd:0.6.0
 ```
 
 **Key env vars** (see [Configuration](#configuration) for the full list):
 
 | Env var | Default | Notes |
 | --- | --- | --- |
-| `PATHLOCKD_PD_ENDPOINTS` | `127.0.0.1:2379` | Comma-separated PD addresses — set this in any non-local deployment |
 | `PATHLOCKD_LISTEN` | `0.0.0.0:50051` | gRPC bind address |
-| `PATHLOCKD_PEERS` | *(none)* | Comma-separated sibling pathlockd addresses; needed only when clients are not sticky to one replica |
+| `PATHLOCKD_DATA_DIR` | `/var/lib/pathlockd` | RocksDB data directory |
+| `PATHLOCKD_NODE_ID` | `pathlockd-0` | Stable node identifier |
+| `PATHLOCKD_BOOTSTRAP` | `false` | Bootstrap a new cluster (single node or first node) |
+| `PATHLOCKD_SEED_NODES` | *(none)* | Comma-separated gossip seed addresses (multi-node) |
+| `PATHLOCKD_PEERS` | *(none)* | Comma-separated sibling addresses for event fan-out |
 | `PATHLOCKD_LOG_LEVEL` | `info` | `trace` / `debug` / `info` / `warn` / `error` |
 
 The daemon runs as a non-root user (`uid 10001`) and exposes a liveness
@@ -197,8 +193,7 @@ The daemon runs as a non-root user (`uid 10001`) and exposes a liveness
 
 ## Quick start (development / playground)
 
-Brings up a single-node TiKV (PD + TiKV) and pathlockd; only the gRPC port is
-published.
+Single-binary quick start — no external services required:
 
 ```bash
 docker compose up --build
@@ -214,28 +209,26 @@ grpcurl -plaintext localhost:50051 pathlockd.v1.PathLock/Health
 
 Or use the typed Node.js client, [`pathlockd-nodejs-client`](https://github.com/alexpacio/pathlockd-nodejs-client).
 
-To develop against TiKV with the daemon running on your host, start just the
-store and run the daemon in-network — see [`llmwiki/06-testing.md`](llmwiki/06-testing.md).
+To run the daemon on your host for development, see
+[`llmwiki/06-testing.md`](llmwiki/06-testing.md).
 
 ## Production deployment
 
-pathlockd is two tiers: a TiKV cluster (the source of truth) and a fleet of
-stateless pathlockd replicas.
+pathlockd runs as a fleet of self-contained nodes with embedded RocksDB and
+Multi-Raft consensus.
 
-1. **Run a real TiKV cluster.** For HA use ≥3 PD and ≥3 TiKV nodes (TiUP,
-   `tikv-operator` on Kubernetes, or your own orchestration). Give pathlockd
-   **all** the PD endpoints (comma-separated) so startup does not depend on one
-   specific PD node being reachable.
-2. **A single instance runs on any container runtime:**
+1. **A single instance runs on any container runtime:**
 
    ```bash
    docker run -d --restart=unless-stopped -p 50051:50051 \
-     -e PATHLOCKD_PD_ENDPOINTS="pd0:2379,pd1:2379,pd2:2379" \
      -e PATHLOCKD_LISTEN="0.0.0.0:50051" \
-     ghcr.io/alexpacio/pathlockd:0.4.4
+     -e PATHLOCKD_DATA_DIR="/data/pathlockd" \
+     -e PATHLOCKD_BOOTSTRAP="true" \
+     -v pathlockd-data:/data/pathlockd \
+     ghcr.io/alexpacio/pathlockd:0.6.0
    ```
 
-3. **Run it replicated (HA) on Kubernetes.** Running *multiple* pathlockd
+2. **Run it replicated (HA) on Kubernetes.** Running *multiple* pathlockd
    replicas with working cross-instance event delivery is supported on
    **Kubernetes only**, deployed as a **StatefulSet behind a headless Service**.
    Ready-to-apply manifests (StatefulSet, headless + client Services, PDB) are in
@@ -243,22 +236,26 @@ stateless pathlockd replicas.
    [Why replication needs Kubernetes](#why-replication-needs-kubernetes) for the
    rationale.
 
-> **Clocks.** Lease expiry is computed from **PD's timestamp oracle (cluster
-> time)**, not the host wall clock, so pathlockd replicas do **not** need their
-> clocks mutually NTP-synced for lease correctness; fencing tokens are likewise
-> PD-ordered and monotonic cluster-wide. (Keep PD/TiKV nodes time-synced as any
-> TiKV deployment requires.)
+   For multi-node, set `PATHLOCKD_SEED_NODES` on all nodes to bootstrap the
+   gossip layer, use `PATHLOCKD_BOOTSTRAP=true` on the first node, and
+   `PATHLOCKD_JOIN=true` on subsequent nodes.
+
+> **Clocks.** Lease expiry uses a leader-stamped `now_ms` carried in every
+> Raft command, so pathlockd replicas do **not** need their clocks mutually
+> NTP-synced for correctness. Fencing tokens are a monotonic counter stored
+> in RocksDB and incremented via Raft.
 
 ### Why replication needs Kubernetes
 
-All lock state lives in TiKV, so any replica can serve any request behind any
-load balancer — that part is platform-agnostic. The constraint is the **per-owner
-event stream** (`Subscribe` → `released` / `killed` / `revoke`): an event is
-raised on whichever replica handled the call, which is frequently a *different*
-replica than the one holding the subscriber (a deadlock `RequestRevoke` or an
-admin `ForceRelease` targets *another* owner). To deliver it, the originating
-replica must forward to the **specific** replica holding that subscription — so
-every replica must be individually addressable *and* know its current peers.
+All lock state lives in the embedded RocksDB engine, so any replica can serve
+any request behind any load balancer — that part is platform-agnostic. The
+constraint is the **per-owner event stream** (`Subscribe` → `released` /
+`killed` / `revoke`): an event is raised on whichever replica handled the call,
+which is frequently a *different* replica than the one holding the subscriber (a
+deadlock `RequestRevoke` or an admin `ForceRelease` targets *another* owner). To
+deliver it, the originating replica must forward to the **specific** replica
+holding that subscription — so every replica must be individually addressable
+*and* know its current peers.
 
 - A **single load-balanced VIP** — a plain Deployment + ClusterIP, or a Docker
   Swarm replicated service reached through its VIP / `tasks.` DNS — can't do
@@ -289,15 +286,20 @@ A TOML file (`--config pathlockd.toml` or `PATHLOCKD_CONFIG`) overlaid by
 | TOML key | Env var | Default | Meaning |
 | --- | --- | --- | --- |
 | `listen` | `PATHLOCKD_LISTEN` | `0.0.0.0:50051` | gRPC listen address |
-| `pd_endpoints` | `PATHLOCKD_PD_ENDPOINTS` | `127.0.0.1:2379` | TiKV PD endpoints (comma-separated in env) |
+| `data_dir` | `PATHLOCKD_DATA_DIR` | `/var/lib/pathlockd` | RocksDB data directory |
+| `node_id` | `PATHLOCKD_NODE_ID` | `pathlockd-0` | Stable node identifier |
+| `seed_nodes` | `PATHLOCKD_SEED_NODES` | `[]` | Gossip seed addresses (comma-separated in env) |
+| `bootstrap` | `PATHLOCKD_BOOTSTRAP` | `false` | Bootstrap a new cluster |
+| `join` | `PATHLOCKD_JOIN` | `false` | Join an existing cluster |
+| `group_count` | `PATHLOCKD_GROUP_COUNT` | `256` | Number of Raft groups |
+| `replication_factor` | `PATHLOCKD_REPLICATION_FACTOR` | `3` | Voters per group (must be odd) |
+| `group_gc_interval_secs` | `PATHLOCKD_GROUP_GC_INTERVAL_SECS` | `1` | GC sweep interval (0 disables) |
+| `group_gc_batch` | `PATHLOCKD_GROUP_GC_BATCH` | `1024` | Keys processed per GC sweep |
+| `rocksdb_wal_sync` | `PATHLOCKD_ROCKSDB_WAL_SYNC` | `true` | Fsync WAL on every write |
 | `peers` | `PATHLOCKD_PEERS` | `[]` | static sibling pathlockd endpoints for cross-instance event fan-out (fixed replica count) |
 | `peer_discovery_dns` | `PATHLOCKD_PEER_DISCOVERY_DNS` | none | `host:port` of a headless Service that resolves to every replica; enables elastic peer fan-out (K8s) |
 | `self_ip` | `PATHLOCKD_SELF_IP` | none | this instance's own IP, to exclude itself from discovered peers (wire from the downward API `status.podIP`) |
 | `peer_refresh_secs` | `PATHLOCKD_PEER_REFRESH_SECS` | `10` | how often to re-resolve `peer_discovery_dns` |
-| `gc_interval_secs` | `PATHLOCKD_GC_INTERVAL_SECS` | `1` | active expiry sweep interval (0 disables; lazy expiry still applies) |
-| `gc_page` | `PATHLOCKD_GC_PAGE` | `1024` | keys scanned per GC page |
-| `mvcc_gc_interval_secs` | `PATHLOCKD_MVCC_GC_INTERVAL_SECS` | `300` | TiKV transactional MVCC GC interval (0 disables) |
-| `mvcc_gc_safe_point_retention_secs` | `PATHLOCKD_MVCC_GC_SAFE_POINT_RETENTION_SECS` | `600` | safepoint lag behind PD time; must be at least 2x request timeout |
 | `event_buffer` | `PATHLOCKD_EVENT_BUFFER` | `8192` | in-process event channel capacity |
 | `log_level` | `PATHLOCKD_LOG_LEVEL` | `info` | tracing filter |
 
@@ -340,9 +342,8 @@ The full contract is in [`proto/pathlockd.proto`](proto/pathlockd.proto). The
 
 ## Building
 
-`cargo build --release` once the native dependencies for the TiKV/gRPC C-core
-are present (`cmake`, `protobuf-compiler`, `pkg-config`, `libssl-dev`). The
-[`Dockerfile`](Dockerfile) installs them in its builder stage, so `docker build`
+`cargo build --release` with standard Rust tooling. The
+[`Dockerfile`](Dockerfile) bundles the builder stage, so `docker build`
 needs nothing on the host.
 
 **Microarch-tuned build** — the default `cargo build --release` targets the
@@ -363,19 +364,14 @@ cargo/protoc/clang). The first run builds a small cached builder image.
 
 ```bash
 ./scripts/test-unit.sh           # crate unit tests (no cluster needed)
-./scripts/test-integration.sh    # brings up TiKV (PD + TiKV) and runs the integration tests
+cargo test --test engine_tests    # lock engine tests (RocksDB integration)
+cargo test --test e2e_tests       # full e2e tests (starts daemon, drives gRPC)
+cargo test --test load            # throughput benchmarks
 ./scripts/test-e2e-stress.sh     # starts peered replicas, checks cross-replica events, runs GC stress
 ```
 
-The cluster used by the integration tests is managed on its own:
-
-```bash
-./scripts/infra.sh up      # start PD + TiKV and wait until ready
-./scripts/infra.sh status  # show container + TiKV store status
-./scripts/infra.sh down    # stop it (reset also wipes the data volumes)
-```
-
-See [`llmwiki/06-testing.md`](llmwiki/06-testing.md).
+Engine tests and e2e tests run directly against the embedded RocksDB — no
+external cluster is needed. See [`llmwiki/06-testing.md`](llmwiki/06-testing.md).
 
 ## Releasing
 

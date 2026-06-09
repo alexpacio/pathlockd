@@ -5,37 +5,62 @@
 # gRPC listen address.
 listen = "0.0.0.0:50051"
 
-# PD endpoints of the TiKV cluster (one or more).
-pd_endpoints = ["127.0.0.1:2379"]
+# Stable node identifier (required).
+node_id = "pathlockd-0"
 
-# Cross-instance event fan-out. Leave all of this unset for a single instance;
-# the client-side recheck poll is always the correctness backstop.
+# RocksDB data directory.
+data_dir = "/var/lib/pathlockd"
+
+# Internal addresses (used for cluster communication).
+public_addr = "http://localhost:50051"
+raft_addr = "http://localhost:50052"
+gossip_addr = "0.0.0.0:7946"
+
+# Bootstrap a new cluster (single node or first node).
+bootstrap = true
+
+# Join an existing cluster (mutually exclusive with bootstrap).
+# join = true
+# seed_nodes = ["node1:7946", "node2:7946"]
+
+# Number of Raft groups (deterministic sharding via HRW hashing).
+group_count = 256
+
+# Raft replication factor (must be odd).
+replication_factor = 3
+
+# Raft tuning.
+raft_snapshot_interval_entries = 10000
+raft_snapshot_min_log_entries = 5000
+raft_max_inflight = 256
+
+# RocksDB tuning.
+rocksdb_wal_sync = true
+rocksdb_max_open_files = 4096
+
+# GC sweep of expired records (0 disables).
+group_gc_interval_secs = 1
+group_gc_batch = 1024
+
+# Cross-instance event fan-out. Leave unset for a single instance; the
+# client-side recheck poll is always the correctness backstop.
 #
-# Static list of sibling replica endpoints (fixed replica count):
+# Static list of sibling peer endpoints:
 peers = []
 #
 # Or, for elastic replicated deployments (Kubernetes), discover peers by
 # resolving a headless-Service DNS name that returns every replica's address.
 # This is the recommended replicated setup; see deploy/kubernetes/.
 # peer_discovery_dns = "pathlockd-headless:50051"
-# self_ip            = "10.0.0.5"   # wired from the K8s downward API status.podIP
+# self_ip            = "10.0.0.5"   # wired from K8s downward API status.podIP
 # peer_refresh_secs  = 10
-
-# Active GC sweep of expired keys, every N seconds (1 reclaims promptly, like a
-# 1Hz expiry cycle). 0 disables it — lazy expiry still guarantees correctness, so
-# raise this on very large keyspaces if the periodic full sweep is too costly.
-gc_interval_secs = 1
-gc_page = 1024
-
-# TiKV transactional MVCC GC. Keep this enabled for standalone TiKV clusters
-# where no TiDB/GC coordinator advances PD's safe point. The retention window
-# must cover the oldest possible in-flight transaction; pathlockd requires at
-# least 2x request_timeout_ms.
-mvcc_gc_interval_secs = 300
-mvcc_gc_safe_point_retention_secs = 600
 
 # In-process event broadcast channel capacity.
 event_buffer = 8192
+
+# Server-side RPC timeout and HTTP/2 concurrency.
+request_timeout_ms = 30000
+max_concurrent_requests_per_connection = 256
 
 # tracing log filter.
 log_level = "info"
