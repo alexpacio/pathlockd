@@ -1,40 +1,45 @@
-//! The lock engine — the atomic primitives, implemented over [`crate::store`].
+//! The lock engine — atomic primitives, implemented generically over [`StoreTxn`].
 //!
-//! Each public function is one primitive: acquire, release, release-all, renew,
-//! force-release, assert-fencing, detect-cycle, is-blocking, plus the
-//! single-key helpers (PD-backed fencing tokens, wait edges, liveness). Conflict
-//! precedence, dead-owner pruning, fencing rules and TTL refreshes are all
-//! enforced here, inside a single serialized transaction per multi-key
-//! operation.
+//! Each engine function is a deterministic inner function that takes a generic
+//! `StoreTxn` implementation. The Raft state machine calls these directly during
+//! apply. The service layer builds Raft commands; the router sends them to the
+//! correct group leader.
+//!
+//! Conflict precedence, dead-owner pruning, fencing rules and TTL refreshes are
+//! all enforced here, inside a single `StoreTxn` call per operation.
+//!
+//! All engine functions are synchronous because the underlying RocksDB
+//! operations are inherently sync. The Raft state machine's apply is also sync.
 
-use tikv_client::{TimestampExt, TransactionClient};
 use tracing::warn;
 
-use crate::store::{
-    alive_key, claim_key, claimdesc_key, fence_key, handler_of, own_key, rd_key, rddesc_key,
-    wait_key, wr_key, wrdesc_key, Tx, FENCE_MIN_TTL_MS, FENCING_COUNTER_KEY, MAX_SET_ENUM_MEMBERS,
+use crate::store_keys::{
+    alive_key, claim_key, claimdesc_key, fence_key, own_prefix, rd_prefix, rddesc_prefix, wait_key,
+    wr_key, wrdesc_key, FENCE_MIN_TTL_MS, MAX_SET_ENUM_MEMBERS,
 };
+use crate::store_rocksdb::StoreTxn;
 
-/// Above this many descendant-index members a single scan starts to
-/// noticeably block, so we log it.
+use crate::store_keys::CF_CLAIMS as CLAIM_CF;
+use crate::store_keys::CF_DESC_CLAIM as CLAIMDESC_CF;
+use crate::store_keys::CF_DESC_READ as RDDESC_CF;
+use crate::store_keys::CF_DESC_WRITE as WRDESC_CF;
+use crate::store_keys::CF_FENCES as FENCE_CF;
+use crate::store_keys::CF_OWNER_ALIVE as ALIVE_CF;
+use crate::store_keys::CF_OWNER_HOLDS as OWN_CF;
+use crate::store_keys::CF_READ_LOCKS as RD_CF;
+use crate::store_keys::CF_WAIT_EDGES as WAIT_CF;
+use crate::store_keys::CF_WRITE_LOCKS as WR_CF;
+
 const SCAN_WARN_THRESHOLD: usize = 1024;
-
-/// Fallback TTL for a preemption claim when the caller does not specify one.
-/// Kept short: a claim only has to bridge the window between the victim
-/// releasing and the winner acquiring, and it self-heals via expiry if the
-/// winner dies before claiming.
 const CLAIM_DEFAULT_TTL_MS: u64 = 3000;
 
-/// The reason string reported when an acquire is blocked by another owner's
-/// live preemption claim. The client treats it as an ordinary transient
-/// conflict (wait + recheck), and [`is_blocking_inner`] knows how to verify it.
 pub const REASON_PREEMPT_CLAIMED: &str = "preempt_claimed";
 
 // ---------------------------------------------------------------------------
-// Public value types (engine-internal; the gRPC service maps proto <-> these)
+// Public value types
 // ---------------------------------------------------------------------------
 
-#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+#[derive(Debug, Clone, Copy, PartialEq, Eq, serde::Serialize, serde::Deserialize)]
 pub enum Mode {
     Write,
     Read,
@@ -49,26 +54,26 @@ impl Mode {
     }
 }
 
-#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+#[derive(Debug, Clone, Copy, PartialEq, Eq, serde::Serialize, serde::Deserialize)]
 pub enum State {
     New,
     Held,
 }
 
-#[derive(Debug, Clone)]
+#[derive(Debug, Clone, serde::Serialize, serde::Deserialize)]
 pub struct LockReq {
-    pub path: String, // path form "handler:path"
+    pub path: String,
     pub mode: Mode,
     pub state: State,
 }
 
-#[derive(Debug, Clone)]
+#[derive(Debug, Clone, serde::Serialize, serde::Deserialize)]
 pub struct RelReq {
     pub path: String,
     pub mode: Mode,
 }
 
-#[derive(Debug, Clone)]
+#[derive(Debug, Clone, serde::Serialize, serde::Deserialize)]
 pub struct AcquireArgs {
     pub owner_id: String,
     pub ttl_ms: u64,
@@ -77,7 +82,7 @@ pub struct AcquireArgs {
     pub release_requests: Vec<RelReq>,
 }
 
-#[derive(Debug, Clone, PartialEq, Eq)]
+#[derive(Debug, Clone, PartialEq, Eq, serde::Serialize, serde::Deserialize)]
 pub enum AcquireOutcome {
     Ok,
     Conflict {
@@ -91,33 +96,33 @@ pub enum AcquireOutcome {
     },
 }
 
-#[derive(Debug, Clone, PartialEq, Eq)]
+#[derive(Debug, Clone, PartialEq, Eq, serde::Serialize, serde::Deserialize)]
 pub enum RenewOutcome {
     Ok,
     Lost { path: String, reason: String },
 }
 
-#[derive(Debug, Clone, PartialEq, Eq)]
+#[derive(Debug, Clone, PartialEq, Eq, serde::Serialize, serde::Deserialize)]
 pub enum AssertOutcome {
     Ok,
     Fail { path: String, reason: String },
 }
 
-#[derive(Debug, Clone, PartialEq, Eq)]
+#[derive(Debug, Clone, PartialEq, Eq, serde::Serialize, serde::Deserialize)]
 pub enum CycleOutcome {
     None,
     Cycle(Vec<String>),
     Truncated(Vec<String>),
 }
 
-#[derive(Debug, Clone, PartialEq, Eq)]
+#[derive(Debug, Clone, PartialEq, Eq, serde::Serialize, serde::Deserialize)]
 pub struct WaitEdgeMetadata {
     pub conflict_path: String,
     pub reason: String,
 }
 
 #[derive(Debug, Clone, PartialEq, Eq)]
-struct WaitEdge {
+pub struct WaitEdge {
     conflict_owner: String,
     metadata: Option<WaitEdgeMetadata>,
 }
@@ -128,15 +133,13 @@ const WAIT_EDGE_V1_PREFIX: &str = "v1:";
 // get_ancestors
 // ---------------------------------------------------------------------------
 
-/// For a path "handler:/a/b/c" returns ["handler:/a/b", "handler:/a",
-/// "handler:/"]. A root path ("handler:/") and a handler-less string yield [].
 pub fn get_ancestors(full_path: &str) -> Vec<String> {
     let mut ancestors = Vec::new();
     let col_idx = match full_path.find(':') {
         Some(i) => i,
         None => return ancestors,
     };
-    let handler = &full_path[..=col_idx]; // includes the ':'
+    let handler = &full_path[..=col_idx];
     let path = &full_path[col_idx + 1..];
 
     let mut current = path.to_string();
@@ -160,73 +163,64 @@ pub fn get_ancestors(full_path: &str) -> Vec<String> {
 }
 
 // ---------------------------------------------------------------------------
-// Shared helpers
+// Shared helpers (all sync)
 // ---------------------------------------------------------------------------
 
-async fn owner_alive(tx: &mut Tx, owner: &str) -> anyhow::Result<bool> {
-    tx.exists_str(&alive_key(owner)).await
+fn owner_alive<T: StoreTxn>(tx: &mut T, owner: &str) -> anyhow::Result<bool> {
+    tx.get_str(ALIVE_CF, &alive_key(owner)).map(|v| v.is_some())
 }
 
-/// `prune_dead_read_owners`: drop read owners whose alive key is gone and return
-/// the survivors. Expired per-member keys are left for active GC.
-async fn prune_dead_read_owners(tx: &mut Tx, rd: &str) -> anyhow::Result<Vec<String>> {
-    let owners = tx.smembers_limited(rd, MAX_SET_ENUM_MEMBERS).await?;
+fn prune_dead_read_owners<T: StoreTxn>(tx: &mut T, path: &str) -> anyhow::Result<Vec<String>> {
+    let rd_pfx = rd_prefix(path);
+    let owners = tx.smembers_limited(RD_CF, &rd_pfx, MAX_SET_ENUM_MEMBERS)?;
     let mut alive = Vec::new();
     for o in owners {
-        if owner_alive(tx, &o).await? {
+        if owner_alive(tx, &o)? {
             alive.push(o);
         } else {
-            tx.srem(rd, &o).await?;
+            tx.srem(RD_CF, &rd_pfx, &o)?;
         }
     }
     Ok(alive)
 }
 
-async fn get_live_write_owner(tx: &mut Tx, path: &str) -> anyhow::Result<Option<String>> {
-    let Some(owner) = tx.get_str(&wr_key(path)).await? else {
+fn get_live_write_owner<T: StoreTxn>(tx: &mut T, path: &str) -> anyhow::Result<Option<String>> {
+    let Some(owner) = tx.get_str(WR_CF, &wr_key(path))? else {
         return Ok(None);
     };
-    if owner_alive(tx, &owner).await? {
+    if owner_alive(tx, &owner)? {
         return Ok(Some(owner));
     }
-
-    tx.del(&wr_key(path)).await?;
-    remove_descendant_indexes(tx, Mode::Write, path).await?;
+    tx.del(WR_CF, &wr_key(path))?;
+    remove_descendant_indexes(tx, Mode::Write, path)?;
     Ok(None)
 }
 
-/// Returns the claimant of a live preemption claim on `path`, or `None`. A
-/// claim whose claimant is no longer alive is pruned and treated as absent, so
-/// a dead winner can never block acquisition (mirrors [`get_live_write_owner`]).
-async fn get_live_claim(tx: &mut Tx, path: &str) -> anyhow::Result<Option<String>> {
+fn get_live_claim<T: StoreTxn>(tx: &mut T, path: &str) -> anyhow::Result<Option<String>> {
     let claim_k = claim_key(path);
-    let Some(claimant) = tx.get_str(&claim_k).await? else {
+    let Some(claimant) = tx.get_str(CLAIM_CF, &claim_k)? else {
         return Ok(None);
     };
-    if owner_alive(tx, &claimant).await? {
+    if owner_alive(tx, &claimant)? {
         return Ok(Some(claimant));
     }
-    tx.del(&claim_k).await?;
-    remove_claim_indexes(tx, path).await?;
+    tx.del(CLAIM_CF, &claim_k)?;
+    remove_claim_indexes(tx, path)?;
     Ok(None)
 }
 
-/// First live claim held by another owner on `path` or any of its ancestors,
-/// returned as a ready conflict outcome. A claim behaves like a brief exclusive
-/// reservation: it blocks both read and write acquires, since the claimant is
-/// about to take a write lock on the contended path.
-async fn find_blocking_claim(
-    tx: &mut Tx,
+fn find_blocking_claim<T: StoreTxn>(
+    tx: &mut T,
     owner: &str,
     path: &str,
 ) -> anyhow::Result<Option<AcquireOutcome>> {
-    if let Some(claimant) = get_live_claim(tx, path).await? {
+    if let Some(claimant) = get_live_claim(tx, path)? {
         if claimant != *owner {
             return Ok(Some(conflict(path, &claimant, REASON_PREEMPT_CLAIMED)));
         }
     }
     for anc in get_ancestors(path) {
-        if let Some(claimant) = get_live_claim(tx, &anc).await? {
+        if let Some(claimant) = get_live_claim(tx, &anc)? {
             if claimant != *owner {
                 return Ok(Some(conflict(&anc, &claimant, REASON_PREEMPT_CLAIMED)));
             }
@@ -235,64 +229,69 @@ async fn find_blocking_claim(
     Ok(None)
 }
 
-async fn add_claim_indexes(tx: &mut Tx, path: &str, ttl_ms: u64) -> anyhow::Result<()> {
+fn add_claim_indexes<T: StoreTxn>(tx: &mut T, path: &str, ttl_ms: u64) -> anyhow::Result<()> {
     for anc in get_ancestors(path) {
-        tx.sadd(&claimdesc_key(&anc), path, ttl_ms).await?;
+        tx.sadd(CLAIMDESC_CF, &claimdesc_key(&anc), path, ttl_ms)?;
     }
     Ok(())
 }
 
-async fn remove_claim_indexes(tx: &mut Tx, path: &str) -> anyhow::Result<()> {
+fn remove_claim_indexes<T: StoreTxn>(tx: &mut T, path: &str) -> anyhow::Result<()> {
     for anc in get_ancestors(path) {
-        tx.srem(&claimdesc_key(&anc), path).await?;
+        tx.srem(CLAIMDESC_CF, &claimdesc_key(&anc), path)?;
     }
     Ok(())
 }
 
-async fn add_descendant_indexes(
-    tx: &mut Tx,
+fn add_descendant_indexes<T: StoreTxn>(
+    tx: &mut T,
     mode: Mode,
     path: &str,
     ttl_ms: u64,
 ) -> anyhow::Result<()> {
     for anc in get_ancestors(path) {
-        let key = if mode == Mode::Write {
-            wrdesc_key(&anc)
+        if mode == Mode::Write {
+            tx.sadd(WRDESC_CF, &wrdesc_key(&anc), path, ttl_ms)?;
         } else {
-            rddesc_key(&anc)
-        };
-        tx.sadd(&key, path, ttl_ms).await?; // SADD + PEXPIRE
+            // Keyed by ancestor (member = descendant path), symmetric with the
+            // write index, so `find_descendant_read_conflict` can enumerate
+            // descendants by scanning `rddesc_prefix(ancestor)`.
+            tx.sadd(RDDESC_CF, &rddesc_prefix(&anc), path, ttl_ms)?;
+        }
     }
     Ok(())
 }
 
-async fn remove_descendant_indexes(tx: &mut Tx, mode: Mode, path: &str) -> anyhow::Result<()> {
+fn remove_descendant_indexes<T: StoreTxn>(
+    tx: &mut T,
+    mode: Mode,
+    path: &str,
+) -> anyhow::Result<()> {
     for anc in get_ancestors(path) {
-        let key = if mode == Mode::Write {
-            wrdesc_key(&anc)
+        if mode == Mode::Write {
+            tx.srem(WRDESC_CF, &wrdesc_key(&anc), path)?;
         } else {
-            rddesc_key(&anc)
-        };
-        tx.srem(&key, path).await?; // SREM + DEL-if-empty
+            tx.srem(RDDESC_CF, &rddesc_prefix(&anc), path)?;
+        }
     }
     Ok(())
 }
 
-async fn find_descendant_write_conflict(
-    tx: &mut Tx,
+fn find_descendant_write_conflict<T: StoreTxn>(
+    tx: &mut T,
     owner_id: &str,
     path: &str,
 ) -> anyhow::Result<Option<(String, String, String)>> {
     let idx = wrdesc_key(path);
-    let candidates = tx.smembers_limited(&idx, MAX_SET_ENUM_MEMBERS).await?;
+    let candidates = tx.smembers_limited(WRDESC_CF, &idx, MAX_SET_ENUM_MEMBERS)?;
     if candidates.len() > SCAN_WARN_THRESHOLD {
-        warn!(key = %idx, count = candidates.len(), "fslock: large wrdesc scan");
+        warn!(key = ?path, count = candidates.len(), "fslock: large wrdesc scan");
     }
     for candidate in candidates {
-        match get_live_write_owner(tx, &candidate).await? {
+        match get_live_write_owner(tx, &candidate)? {
             None => {
-                tx.srem(&idx, &candidate).await?;
-                remove_descendant_indexes(tx, Mode::Write, &candidate).await?;
+                tx.srem(WRDESC_CF, &idx, &candidate)?;
+                remove_descendant_indexes(tx, Mode::Write, &candidate)?;
             }
             Some(owner) if owner != owner_id => {
                 return Ok(Some((candidate, owner, "descendant_write_locked".into())));
@@ -303,22 +302,22 @@ async fn find_descendant_write_conflict(
     Ok(None)
 }
 
-async fn find_descendant_read_conflict(
-    tx: &mut Tx,
+fn find_descendant_read_conflict<T: StoreTxn>(
+    tx: &mut T,
     owner_id: &str,
     path: &str,
 ) -> anyhow::Result<Option<(String, String, String)>> {
-    let idx = rddesc_key(path);
-    let candidates = tx.smembers_limited(&idx, MAX_SET_ENUM_MEMBERS).await?;
-    if candidates.len() > SCAN_WARN_THRESHOLD {
-        warn!(key = %idx, count = candidates.len(), "fslock: large rddesc scan");
-    }
+    let idx_pfx = rddesc_prefix(path);
+    let candidates = tx.smembers_limited(RDDESC_CF, &idx_pfx, MAX_SET_ENUM_MEMBERS)?;
+    let mut seen = std::collections::HashSet::new();
     for candidate in candidates {
-        let rd = rd_key(&candidate);
-        let owners = prune_dead_read_owners(tx, &rd).await?;
+        if !seen.insert(candidate.clone()) {
+            continue;
+        }
+        let owners = prune_dead_read_owners(tx, &candidate)?;
         if owners.is_empty() {
-            tx.srem(&idx, &candidate).await?;
-            remove_descendant_indexes(tx, Mode::Read, &candidate).await?;
+            tx.srem(RDDESC_CF, &idx_pfx, &candidate)?;
+            remove_descendant_indexes(tx, Mode::Read, &candidate)?;
         } else {
             for owner in owners {
                 if owner != owner_id {
@@ -330,21 +329,21 @@ async fn find_descendant_read_conflict(
     Ok(None)
 }
 
-async fn find_descendant_claim_conflict(
-    tx: &mut Tx,
+fn find_descendant_claim_conflict<T: StoreTxn>(
+    tx: &mut T,
     owner_id: &str,
     path: &str,
 ) -> anyhow::Result<Option<AcquireOutcome>> {
     let idx = claimdesc_key(path);
-    let candidates = tx.smembers_limited(&idx, MAX_SET_ENUM_MEMBERS).await?;
+    let candidates = tx.smembers_limited(CLAIMDESC_CF, &idx, MAX_SET_ENUM_MEMBERS)?;
     if candidates.len() > SCAN_WARN_THRESHOLD {
-        warn!(key = %idx, count = candidates.len(), "fslock: large claimdesc scan");
+        warn!(key = ?path, count = candidates.len(), "fslock: large claimdesc scan");
     }
     for candidate in candidates {
-        match get_live_claim(tx, &candidate).await? {
+        match get_live_claim(tx, &candidate)? {
             None => {
-                tx.srem(&idx, &candidate).await?;
-                remove_claim_indexes(tx, &candidate).await?;
+                tx.srem(CLAIMDESC_CF, &idx, &candidate)?;
+                remove_claim_indexes(tx, &candidate)?;
             }
             Some(claimant) if claimant != owner_id => {
                 return Ok(Some(conflict(
@@ -359,22 +358,22 @@ async fn find_descendant_claim_conflict(
     Ok(None)
 }
 
-async fn remove_owned_descendant_claims(
-    tx: &mut Tx,
+fn remove_owned_descendant_claims<T: StoreTxn>(
+    tx: &mut T,
     owner_id: &str,
     path: &str,
 ) -> anyhow::Result<()> {
     let idx = claimdesc_key(path);
-    let candidates = tx.smembers_limited(&idx, MAX_SET_ENUM_MEMBERS).await?;
+    let candidates = tx.smembers_limited(CLAIMDESC_CF, &idx, MAX_SET_ENUM_MEMBERS)?;
     for candidate in candidates {
-        match get_live_claim(tx, &candidate).await? {
+        match get_live_claim(tx, &candidate)? {
             None => {
-                tx.srem(&idx, &candidate).await?;
-                remove_claim_indexes(tx, &candidate).await?;
+                tx.srem(CLAIMDESC_CF, &idx, &candidate)?;
+                remove_claim_indexes(tx, &candidate)?;
             }
             Some(claimant) if claimant == owner_id => {
-                tx.del(&claim_key(&candidate)).await?;
-                remove_claim_indexes(tx, &candidate).await?;
+                tx.del(CLAIM_CF, &claim_key(&candidate))?;
+                remove_claim_indexes(tx, &candidate)?;
             }
             Some(_) => {}
         }
@@ -386,46 +385,23 @@ async fn remove_owned_descendant_claims(
 // ACQUIRE
 // ---------------------------------------------------------------------------
 
-pub async fn acquire(
-    client: &TransactionClient,
-    args: AcquireArgs,
+pub fn acquire_inner<T: StoreTxn>(
+    tx: &mut T,
+    args: &AcquireArgs,
 ) -> anyhow::Result<AcquireOutcome> {
-    // Commit only a successful acquire. A CONFLICT/LOST outcome performed no
-    // durable mutation worth keeping (only snapshot reads + opportunistic
-    // pruning), so rolling it back avoids serializing failed attempts and
-    // discards any buffered writes from the defensive execution-phase guard.
-    txn_retry!(client, commit_if: |o: &AcquireOutcome| matches!(o, AcquireOutcome::Ok), tx => {
-        acquire_inner(&mut tx, &args).await
-    })
-}
-
-async fn acquire_inner(tx: &mut Tx, args: &AcquireArgs) -> anyhow::Result<AcquireOutcome> {
     let owner = &args.owner_id;
     let ttl = args.ttl_ms;
     let fence_ttl = ttl.max(FENCE_MIN_TTL_MS);
     let token = args.fencing_token;
     let alive_k = alive_key(owner);
-    let own_k = own_key(owner);
+    let own_pfx = own_prefix(owner);
 
-    // A no-op call (nothing to acquire or release) must not stamp an orphan
-    // alive key with no owned paths; just succeed.
     if args.requests.is_empty() && args.release_requests.is_empty() {
         return Ok(AcquireOutcome::Ok);
     }
 
-    // Join the serialization domain of every handler this call touches, so a
-    // concurrent mutation sharing a handler conflicts at commit. Containment
-    // hazards never cross handlers, so per-handler scope is sufficient. These
-    // writes are discarded by the rollback if the outcome is CONFLICT/LOST.
-    for r in &args.requests {
-        tx.serialize_handler(handler_of(&r.path)).await?;
-    }
-    for r in &args.release_requests {
-        tx.serialize_handler(handler_of(&r.path)).await?;
-    }
-
     let has_held = args.requests.iter().any(|r| r.state == State::Held);
-    if has_held && !tx.exists_str(&alive_k).await? {
+    if has_held && tx.get_str(ALIVE_CF, &alive_k)?.is_none() {
         return Ok(AcquireOutcome::Lost {
             path: String::new(),
             reason: "missing_alive".into(),
@@ -438,73 +414,67 @@ async fn acquire_inner(tx: &mut Tx, args: &AcquireArgs) -> anyhow::Result<Acquir
         match req.state {
             State::Held => {
                 if req.mode == Mode::Write {
-                    if tx.get_str(&wr_key(path)).await?.as_deref() != Some(owner.as_str()) {
+                    if tx.get_str(WR_CF, &wr_key(path))?.as_deref() != Some(owner.as_str()) {
                         return Ok(lost(path, "missing_write"));
                     }
-                    match parse_fence(tx.get_str(&fence_key(path)).await?) {
+                    match parse_fence(tx.get_str(FENCE_CF, &fence_key(path))?) {
                         None => return Ok(lost(path, "missing_fence")),
                         Some(cur) if cur > token => {
                             return Ok(conflict(path, &cur.to_string(), "stale_fencing_token"))
                         }
                         Some(_) => {}
                     }
-                } else if !tx.sismember(&rd_key(path), owner).await? {
-                    return Ok(lost(path, "missing_read"));
+                } else {
+                    let rd_pfx = rd_prefix(path);
+                    if !tx.sismember(RD_CF, &rd_pfx, owner)? {
+                        return Ok(lost(path, "missing_read"));
+                    }
                 }
             }
             State::New => {
-                // A. ancestors checked for WRITE locks (top-down blocking)
                 for anc in get_ancestors(path) {
-                    if let Some(anc_owner) = get_live_write_owner(tx, &anc).await? {
+                    if let Some(anc_owner) = get_live_write_owner(tx, &anc)? {
                         if anc_owner != *owner {
                             return Ok(conflict(&anc, &anc_owner, "ancestor_locked"));
                         }
                     }
                 }
-                // B. self direct conflict
-                if let Some(wr_owner) = get_live_write_owner(tx, path).await? {
+                if let Some(wr_owner) = get_live_write_owner(tx, path)? {
                     if wr_owner != *owner {
                         return Ok(conflict(path, &wr_owner, "write_locked"));
                     }
                 }
-                // B'. another owner's preemption claim on this path or an
-                // ancestor reserves it for the deadlock winner; block until it
-                // expires or the winner converts it into a real lock.
-                if let Some(outcome) = find_blocking_claim(tx, owner, path).await? {
+                if let Some(outcome) = find_blocking_claim(tx, owner, path)? {
                     return Ok(outcome);
                 }
                 if req.mode == Mode::Write {
-                    if let Some(outcome) = find_descendant_claim_conflict(tx, owner, path).await? {
+                    if let Some(outcome) = find_descendant_claim_conflict(tx, owner, path)? {
                         return Ok(outcome);
                     }
-                    // Reads are point-only: an ancestor read does not cover this path.
-                    let rd_owners = prune_dead_read_owners(tx, &rd_key(path)).await?;
+                    let rd_owners = prune_dead_read_owners(tx, path)?;
                     if rd_owners.is_empty() {
-                        remove_descendant_indexes(tx, Mode::Read, path).await?;
+                        remove_descendant_indexes(tx, Mode::Read, path)?;
                     }
                     for o in &rd_owners {
                         if o != owner {
                             return Ok(conflict(path, o, "read_locked"));
                         }
                     }
-                    // C. descendant write/read subtree must be clear.
-                    if let Some((p, o, r)) = find_descendant_write_conflict(tx, owner, path).await?
-                    {
+                    if let Some((p, o, r)) = find_descendant_write_conflict(tx, owner, path)? {
                         return Ok(AcquireOutcome::Conflict {
                             path: p,
                             owner: o,
                             reason: r,
                         });
                     }
-                    if let Some((p, o, r)) = find_descendant_read_conflict(tx, owner, path).await? {
+                    if let Some((p, o, r)) = find_descendant_read_conflict(tx, owner, path)? {
                         return Ok(AcquireOutcome::Conflict {
                             path: p,
                             owner: o,
                             reason: r,
                         });
                     }
-                    // D. fencing token must be monotonic per write-locked path.
-                    if let Some(cur) = parse_fence(tx.get_str(&fence_key(path)).await?) {
+                    if let Some(cur) = parse_fence(tx.get_str(FENCE_CF, &fence_key(path))?) {
                         if cur > token {
                             return Ok(conflict(path, &cur.to_string(), "stale_fencing_token"));
                         }
@@ -515,21 +485,17 @@ async fn acquire_inner(tx: &mut Tx, args: &AcquireArgs) -> anyhow::Result<Acquir
     }
 
     // 2. EXECUTION PHASE
-    tx.set_str(&alive_k, "1", ttl).await?;
+    tx.set_str(ALIVE_CF, &alive_k, "1", ttl)?;
 
     for req in &args.requests {
         let path = &req.path;
         let member = format!("{}:{}", req.mode.as_str(), path);
-        tx.sadd(&own_k, &member, ttl).await?;
+        tx.sadd(OWN_CF, &own_pfx, &member, ttl)?;
 
-        // We are taking (or refreshing) this path, so any preemption claim we
-        // planted on it has served its purpose — drop it so it stops blocking
-        // unrelated owners for the rest of its TTL. Claims owned by others were
-        // already rejected in the validation phase.
         let claim_k = claim_key(path);
-        if tx.get_str(&claim_k).await?.as_deref() == Some(owner.as_str()) {
-            tx.del(&claim_k).await?;
-            remove_claim_indexes(tx, path).await?;
+        if tx.get_str(CLAIM_CF, &claim_k)?.as_deref() == Some(owner.as_str()) {
+            tx.del(CLAIM_CF, &claim_k)?;
+            remove_claim_indexes(tx, path)?;
         }
 
         if req.mode == Mode::Write {
@@ -537,50 +503,44 @@ async fn acquire_inner(tx: &mut Tx, args: &AcquireArgs) -> anyhow::Result<Acquir
             let fence_k = fence_key(path);
             match req.state {
                 State::Held => {
-                    tx.pexpire_str(&wr_k, ttl).await?;
-                    tx.set_str(&fence_k, &token.to_string(), fence_ttl).await?;
-                    add_descendant_indexes(tx, Mode::Write, path, ttl).await?;
+                    tx.pexpire_str(WR_CF, &wr_k, ttl)?;
+                    tx.set_str(FENCE_CF, &fence_k, &token.to_string(), fence_ttl)?;
+                    add_descendant_indexes(tx, Mode::Write, path, ttl)?;
                 }
                 State::New => {
-                    // "acquire if absent or already owned"
-                    if tx.get_str(&wr_k).await?.is_none() {
-                        tx.set_str(&wr_k, owner, ttl).await?;
-                        tx.set_str(&fence_k, &token.to_string(), fence_ttl).await?;
-                        add_descendant_indexes(tx, Mode::Write, path, ttl).await?;
+                    if tx.get_str(WR_CF, &wr_k)?.is_none() {
+                        tx.set_str(WR_CF, &wr_k, owner, ttl)?;
+                        tx.set_str(FENCE_CF, &fence_k, &token.to_string(), fence_ttl)?;
+                        add_descendant_indexes(tx, Mode::Write, path, ttl)?;
                     } else {
-                        let current = tx.get_str(&wr_k).await?.unwrap_or_default();
+                        let current = tx.get_str(WR_CF, &wr_k)?.unwrap_or_default();
                         if current == *owner {
-                            tx.pexpire_str(&wr_k, ttl).await?;
-                            // Advance the fence to the (validated >= current)
-                            // token, matching the Held re-validation path.
-                            tx.set_str(&fence_k, &token.to_string(), fence_ttl).await?;
-                            add_descendant_indexes(tx, Mode::Write, path, ttl).await?;
+                            tx.pexpire_str(WR_CF, &wr_k, ttl)?;
+                            tx.set_str(FENCE_CF, &fence_k, &token.to_string(), fence_ttl)?;
+                            add_descendant_indexes(tx, Mode::Write, path, ttl)?;
                         } else {
-                            // Unreachable: validation already proved this path is
-                            // absent or owned by us. Defensive only — and harmless,
-                            // since commit_if rolls back any buffered writes on a
-                            // non-Ok outcome rather than committing partial state.
                             return Ok(conflict(path, &current, "write_locked"));
                         }
                     }
                 }
             }
-            remove_owned_descendant_claims(tx, owner, path).await?;
+            remove_owned_descendant_claims(tx, owner, path)?;
         } else {
-            tx.sadd(&rd_key(path), owner, ttl).await?;
-            add_descendant_indexes(tx, Mode::Read, path, ttl).await?;
+            let rd_pfx = rd_prefix(path);
+            tx.sadd(RD_CF, &rd_pfx, owner, ttl)?;
+            add_descendant_indexes(tx, Mode::Read, path, ttl)?;
         }
     }
 
-    // 2b. REFRESH THE REST OF THE LEASE.
+    // 2b. REFRESH THE REST OF THE LEASE
     let requested: std::collections::HashSet<String> = args
         .requests
         .iter()
         .map(|r| format!("{}:{}", r.mode.as_str(), &r.path))
         .collect();
-    for member in tx.smembers_limited(&own_k, MAX_SET_ENUM_MEMBERS).await? {
+    for member in tx.smembers_limited(OWN_CF, &own_pfx, MAX_SET_ENUM_MEMBERS)? {
         if requested.contains(&member) {
-            continue; // already refreshed above, with full New/Held handling
+            continue;
         }
         let Some(sep) = member.find(':') else {
             continue;
@@ -588,58 +548,66 @@ async fn acquire_inner(tx: &mut Tx, args: &AcquireArgs) -> anyhow::Result<Acquir
         let (mode, path) = (&member[..sep], member[sep + 1..].to_string());
         if mode == "write" {
             let wr_k = wr_key(&path);
-            if tx.get_str(&wr_k).await?.as_deref() != Some(owner.as_str()) {
+            if tx.get_str(WR_CF, &wr_k)?.as_deref() != Some(owner.as_str()) {
                 return Ok(lost(&path, "missing_write"));
             }
-            tx.pexpire_str(&wr_k, ttl).await?;
-            match parse_fence(tx.get_str(&fence_key(&path)).await?) {
+            tx.pexpire_str(WR_CF, &wr_k, ttl)?;
+            match parse_fence(tx.get_str(FENCE_CF, &fence_key(&path))?) {
                 None => return Ok(lost(&path, "missing_fence")),
                 Some(cur) if token > 0 && cur > token => {
                     return Ok(conflict(&path, &cur.to_string(), "stale_fencing_token"));
                 }
                 Some(cur) => {
                     let refreshed = if token > 0 { token.max(cur) } else { cur };
-                    tx.set_str(&fence_key(&path), &refreshed.to_string(), fence_ttl)
-                        .await?;
+                    tx.set_str(
+                        FENCE_CF,
+                        &fence_key(&path),
+                        &refreshed.to_string(),
+                        fence_ttl,
+                    )?;
                 }
             }
-            add_descendant_indexes(tx, Mode::Write, &path, ttl).await?;
-            tx.sadd(&own_k, &member, ttl).await?;
+            add_descendant_indexes(tx, Mode::Write, &path, ttl)?;
+            tx.sadd(OWN_CF, &own_pfx, &member, ttl)?;
         } else if mode == "read" {
-            let rd = rd_key(&path);
-            if !tx.sismember(&rd, owner).await? {
+            let rd_pfx = rd_prefix(&path);
+            if !tx.sismember(RD_CF, &rd_pfx, owner)? {
                 return Ok(lost(&path, "missing_read"));
             }
-            tx.sadd(&rd, owner, ttl).await?;
-            add_descendant_indexes(tx, Mode::Read, &path, ttl).await?;
-            tx.sadd(&own_k, &member, ttl).await?;
+            tx.sadd(RD_CF, &rd_pfx, owner, ttl)?;
+            add_descendant_indexes(tx, Mode::Read, &path, ttl)?;
+            tx.sadd(OWN_CF, &own_pfx, &member, ttl)?;
         }
     }
 
-    // 3. INLINE RELEASE PHASE (shadowing transitions, atomic with the acquire)
+    // 3. INLINE RELEASE PHASE
     if !args.release_requests.is_empty() {
         for req in &args.release_requests {
             let path = &req.path;
             let member = format!("{}:{}", req.mode.as_str(), path);
-            tx.srem(&own_k, &member).await?;
+            tx.srem(OWN_CF, &own_pfx, &member)?;
 
             if req.mode == Mode::Write {
                 let wr_k = wr_key(path);
-                if tx.get_str(&wr_k).await?.as_deref() == Some(owner.as_str()) {
-                    tx.del(&wr_k).await?;
-                    remove_descendant_indexes(tx, Mode::Write, path).await?;
+                if tx.get_str(WR_CF, &wr_k)?.as_deref() == Some(owner.as_str()) {
+                    tx.del(WR_CF, &wr_k)?;
+                    remove_descendant_indexes(tx, Mode::Write, path)?;
                 }
             } else {
-                let rd = rd_key(path);
-                tx.srem(&rd, owner).await?;
-                if !tx.has_live_member(&rd).await? {
-                    remove_descendant_indexes(tx, Mode::Read, path).await?;
+                let rd_pfx = rd_prefix(path);
+                tx.srem(RD_CF, &rd_pfx, owner)?;
+                if !tx.has_live_member(RD_CF, &rd_pfx)? {
+                    remove_descendant_indexes(tx, Mode::Read, path)?;
                 }
             }
         }
-
-        if !tx.has_live_member(&own_k).await? {
-            tx.del(&alive_k).await?;
+        // Only drop the owner's liveness marker when this op acquired nothing.
+        // If we just acquired locks, the owner is alive regardless of what
+        // committed state shows: those memberships live in the uncommitted
+        // WriteBatch and `has_live_member` reads only committed state, so it
+        // would otherwise orphan the freshly-acquired lock's ALIVE record.
+        if args.requests.is_empty() && !tx.has_live_member(OWN_CF, &own_pfx)? {
+            tx.del(ALIVE_CF, &alive_k)?;
         }
     }
 
@@ -650,54 +618,41 @@ async fn acquire_inner(tx: &mut Tx, args: &AcquireArgs) -> anyhow::Result<Acquir
 // RELEASE
 // ---------------------------------------------------------------------------
 
-pub async fn release(
-    client: &TransactionClient,
+pub fn release_inner<T: StoreTxn>(
+    tx: &mut T,
     owner: &str,
     reqs: &[RelReq],
     del_wait_key: bool,
 ) -> anyhow::Result<()> {
-    txn_retry!(client, tx => { release_inner(&mut tx, owner, reqs, del_wait_key).await })
-}
-
-async fn release_inner(
-    tx: &mut Tx,
-    owner: &str,
-    reqs: &[RelReq],
-    del_wait_key: bool,
-) -> anyhow::Result<()> {
-    let own_k = own_key(owner);
+    let own_pfx = own_prefix(owner);
     let alive_k = alive_key(owner);
-
-    for req in reqs {
-        tx.serialize_handler(handler_of(&req.path)).await?;
-    }
 
     for req in reqs {
         let path = &req.path;
         let member = format!("{}:{}", req.mode.as_str(), path);
-        tx.srem(&own_k, &member).await?;
+        tx.srem(OWN_CF, &own_pfx, &member)?;
 
         if req.mode == Mode::Write {
             let wr_k = wr_key(path);
-            if tx.get_str(&wr_k).await?.as_deref() == Some(owner) {
-                tx.del(&wr_k).await?;
-                remove_descendant_indexes(tx, Mode::Write, path).await?;
+            if tx.get_str(WR_CF, &wr_k)?.as_deref() == Some(owner) {
+                tx.del(WR_CF, &wr_k)?;
+                remove_descendant_indexes(tx, Mode::Write, path)?;
             }
         } else {
-            let rd = rd_key(path);
-            tx.srem(&rd, owner).await?;
-            if !tx.has_live_member(&rd).await? {
-                remove_descendant_indexes(tx, Mode::Read, path).await?;
+            let rd_pfx = rd_prefix(path);
+            tx.srem(RD_CF, &rd_pfx, owner)?;
+            if !tx.has_live_member(RD_CF, &rd_pfx)? {
+                remove_descendant_indexes(tx, Mode::Read, path)?;
             }
         }
     }
 
-    if !tx.has_live_member(&own_k).await? {
-        tx.del(&alive_k).await?;
+    if !tx.has_live_member(OWN_CF, &own_pfx)? {
+        tx.del(ALIVE_CF, &alive_k)?;
     }
 
     if del_wait_key {
-        tx.del(&wait_key(owner)).await?;
+        tx.del(WAIT_CF, &wait_key(owner))?;
     }
 
     Ok(())
@@ -707,44 +662,34 @@ async fn release_inner(
 // RELEASE_ALL
 // ---------------------------------------------------------------------------
 
-pub async fn release_all(
-    client: &TransactionClient,
+pub fn release_all_inner<T: StoreTxn>(
+    tx: &mut T,
     owner: &str,
     del_wait_key: bool,
 ) -> anyhow::Result<()> {
-    txn_retry!(client, tx => { release_all_inner(&mut tx, owner, del_wait_key).await })
-}
-
-async fn release_all_inner(tx: &mut Tx, owner: &str, del_wait_key: bool) -> anyhow::Result<()> {
-    let own_k = own_key(owner);
+    let own_pfx = own_prefix(owner);
     let alive_k = alive_key(owner);
-    let held = tx.smembers_limited(&own_k, MAX_SET_ENUM_MEMBERS).await?;
-
-    for item in &held {
-        if let Some(sep) = item.find(':') {
-            tx.serialize_handler(handler_of(&item[sep + 1..])).await?;
-        }
-    }
+    let held = tx.smembers_limited(OWN_CF, &own_pfx, MAX_SET_ENUM_MEMBERS)?;
 
     for item in &held {
         match item.find(':') {
             None => {
-                tx.srem(&own_k, item).await?;
+                tx.srem(OWN_CF, &own_pfx, item)?;
             }
             Some(sep) => {
                 let mode = &item[..sep];
                 let path = &item[sep + 1..];
                 if mode == "write" {
                     let wr_k = wr_key(path);
-                    if tx.get_str(&wr_k).await?.as_deref() == Some(owner) {
-                        tx.del(&wr_k).await?;
-                        remove_descendant_indexes(tx, Mode::Write, path).await?;
+                    if tx.get_str(WR_CF, &wr_k)?.as_deref() == Some(owner) {
+                        tx.del(WR_CF, &wr_k)?;
+                        remove_descendant_indexes(tx, Mode::Write, path)?;
                     }
                 } else if mode == "read" {
-                    let rd = rd_key(path);
-                    tx.srem(&rd, owner).await?;
-                    if !tx.has_live_member(&rd).await? {
-                        remove_descendant_indexes(tx, Mode::Read, path).await?;
+                    let rd_pfx = rd_prefix(path);
+                    tx.srem(RD_CF, &rd_pfx, owner)?;
+                    if !tx.has_live_member(RD_CF, &rd_pfx)? {
+                        remove_descendant_indexes(tx, Mode::Read, path)?;
                     }
                 }
             }
@@ -752,11 +697,11 @@ async fn release_all_inner(tx: &mut Tx, owner: &str, del_wait_key: bool) -> anyh
     }
 
     for item in &held {
-        tx.srem(&own_k, item).await?;
+        tx.srem(OWN_CF, &own_pfx, item)?;
     }
-    tx.del(&alive_k).await?;
+    tx.del(ALIVE_CF, &alive_k)?;
     if del_wait_key {
-        tx.del(&wait_key(owner)).await?;
+        tx.del(WAIT_CF, &wait_key(owner))?;
     }
     Ok(())
 }
@@ -765,39 +710,23 @@ async fn release_all_inner(tx: &mut Tx, owner: &str, del_wait_key: bool) -> anyh
 // RENEW
 // ---------------------------------------------------------------------------
 
-pub async fn renew(
-    client: &TransactionClient,
+pub fn renew_inner<T: StoreTxn>(
+    tx: &mut T,
     owner: &str,
     ttl_ms: u64,
 ) -> anyhow::Result<RenewOutcome> {
-    // Commit only a successful renewal. LOST can be discovered after the
-    // renewal has already refreshed earlier keys in the transaction, so rolling
-    // it back keeps the lease state from being partially extended after the
-    // caller has been told the lock is gone.
-    txn_retry!(client, commit_if: |o: &RenewOutcome| matches!(o, RenewOutcome::Ok), tx => {
-        renew_inner(&mut tx, owner, ttl_ms).await
-    })
-}
-
-async fn renew_inner(tx: &mut Tx, owner: &str, ttl_ms: u64) -> anyhow::Result<RenewOutcome> {
     let fence_ttl = ttl_ms.max(FENCE_MIN_TTL_MS);
     let alive_k = alive_key(owner);
-    let own_k = own_key(owner);
+    let own_pfx = own_prefix(owner);
 
-    if !tx.exists_str(&alive_k).await? {
+    if tx.get_str(ALIVE_CF, &alive_k)?.is_none() {
         return Ok(renew_lost("", "missing_alive"));
     }
-    tx.pexpire_str(&alive_k, ttl_ms).await?;
+    tx.pexpire_str(ALIVE_CF, &alive_k, ttl_ms)?;
 
-    let held = tx.smembers_limited(&own_k, MAX_SET_ENUM_MEMBERS).await?;
+    let held = tx.smembers_limited(OWN_CF, &own_pfx, MAX_SET_ENUM_MEMBERS)?;
     if held.is_empty() {
         return Ok(renew_lost("", "missing_owner_set"));
-    }
-
-    for item in &held {
-        if let Some(sep) = item.find(':') {
-            tx.serialize_handler(handler_of(&item[sep + 1..])).await?;
-        }
     }
 
     let mut renewed = 0usize;
@@ -805,43 +734,41 @@ async fn renew_inner(tx: &mut Tx, owner: &str, ttl_ms: u64) -> anyhow::Result<Re
     for item in &held {
         match item.find(':') {
             None => {
-                tx.srem(&own_k, item).await?;
+                tx.srem(OWN_CF, &own_pfx, item)?;
             }
             Some(sep) => {
                 let mode = &item[..sep];
                 let path = item[sep + 1..].to_string();
                 if mode == "write" {
                     let wr_k = wr_key(&path);
-                    if tx.get_str(&wr_k).await?.as_deref() != Some(owner) {
+                    if tx.get_str(WR_CF, &wr_k)?.as_deref() != Some(owner) {
                         return Ok(renew_lost(&path, "missing_write"));
                     }
-                    tx.pexpire_str(&wr_k, ttl_ms).await?;
+                    tx.pexpire_str(WR_CF, &wr_k, ttl_ms)?;
                     let fence_k = fence_key(&path);
-                    if !tx.exists_str(&fence_k).await? {
+                    if tx.get_str(FENCE_CF, &fence_k)?.is_none() {
                         return Ok(renew_lost(&path, "missing_fence"));
                     }
-                    tx.pexpire_str(&fence_k, fence_ttl).await?;
-                    add_descendant_indexes(tx, Mode::Write, &path, ttl_ms).await?;
-                    tx.sadd(&own_k, item, ttl_ms).await?;
+                    tx.pexpire_str(FENCE_CF, &fence_k, fence_ttl)?;
+                    add_descendant_indexes(tx, Mode::Write, &path, ttl_ms)?;
+                    tx.sadd(OWN_CF, &own_pfx, item, ttl_ms)?;
                     renewed += 1;
                 } else if mode == "read" {
-                    let rd = rd_key(&path);
-                    let owners = prune_dead_read_owners(tx, &rd).await?;
+                    let rd_pfx = rd_prefix(&path);
+                    let owners = prune_dead_read_owners(tx, &path)?;
                     if owners.is_empty() {
-                        remove_descendant_indexes(tx, Mode::Read, &path).await?;
+                        remove_descendant_indexes(tx, Mode::Read, &path)?;
                     }
                     if owners.iter().any(|o| o == owner) {
-                        // Extend only this owner's membership (per-member expiry),
-                        // never the whole set — other readers keep their own leases.
-                        tx.sadd(&rd, owner, ttl_ms).await?;
-                        add_descendant_indexes(tx, Mode::Read, &path, ttl_ms).await?;
-                        tx.sadd(&own_k, item, ttl_ms).await?;
+                        tx.sadd(RD_CF, &rd_pfx, owner, ttl_ms)?;
+                        add_descendant_indexes(tx, Mode::Read, &path, ttl_ms)?;
+                        tx.sadd(OWN_CF, &own_pfx, item, ttl_ms)?;
                         renewed += 1;
                     } else {
                         return Ok(renew_lost(&path, "missing_read"));
                     }
                 } else {
-                    tx.srem(&own_k, item).await?;
+                    tx.srem(OWN_CF, &own_pfx, item)?;
                 }
             }
         }
@@ -857,39 +784,29 @@ async fn renew_inner(tx: &mut Tx, owner: &str, ttl_ms: u64) -> anyhow::Result<Re
 // FORCE_RELEASE
 // ---------------------------------------------------------------------------
 
-pub async fn force_release(client: &TransactionClient, victim: &str) -> anyhow::Result<()> {
-    txn_retry!(client, tx => { force_release_inner(&mut tx, victim).await })
-}
-
-async fn force_release_inner(tx: &mut Tx, victim: &str) -> anyhow::Result<()> {
-    let own_k = own_key(victim);
-    let held = tx.smembers_limited(&own_k, MAX_SET_ENUM_MEMBERS).await?;
-
-    for item in &held {
-        if let Some(sep) = item.find(':') {
-            tx.serialize_handler(handler_of(&item[sep + 1..])).await?;
-        }
-    }
+pub fn force_release_inner<T: StoreTxn>(tx: &mut T, victim: &str) -> anyhow::Result<()> {
+    let own_pfx = own_prefix(victim);
+    let held = tx.smembers_limited(OWN_CF, &own_pfx, MAX_SET_ENUM_MEMBERS)?;
 
     for item in &held {
         match item.find(':') {
             None => {
-                tx.srem(&own_k, item).await?;
+                tx.srem(OWN_CF, &own_pfx, item)?;
             }
             Some(sep) => {
                 let mode = &item[..sep];
                 let path = &item[sep + 1..];
                 if mode == "write" {
                     let wr_k = wr_key(path);
-                    if tx.get_str(&wr_k).await?.as_deref() == Some(victim) {
-                        tx.del(&wr_k).await?;
-                        remove_descendant_indexes(tx, Mode::Write, path).await?;
+                    if tx.get_str(WR_CF, &wr_k)?.as_deref() == Some(victim) {
+                        tx.del(WR_CF, &wr_k)?;
+                        remove_descendant_indexes(tx, Mode::Write, path)?;
                     }
                 } else {
-                    let rd = rd_key(path);
-                    tx.srem(&rd, victim).await?;
-                    if !tx.has_live_member(&rd).await? {
-                        remove_descendant_indexes(tx, Mode::Read, path).await?;
+                    let rd_pfx = rd_prefix(path);
+                    tx.srem(RD_CF, &rd_pfx, victim)?;
+                    if !tx.has_live_member(RD_CF, &rd_pfx)? {
+                        remove_descendant_indexes(tx, Mode::Read, path)?;
                     }
                 }
             }
@@ -897,41 +814,32 @@ async fn force_release_inner(tx: &mut Tx, victim: &str) -> anyhow::Result<()> {
     }
 
     for item in &held {
-        tx.srem(&own_k, item).await?;
+        tx.srem(OWN_CF, &own_pfx, item)?;
     }
-    tx.del(&alive_key(victim)).await?;
-    tx.del(&wait_key(victim)).await?;
+    tx.del(ALIVE_CF, &alive_key(victim))?;
+    tx.del(WAIT_CF, &wait_key(victim))?;
     Ok(())
 }
 
 // ---------------------------------------------------------------------------
-// ASSERT_FENCING (read-only)
+// ASSERT_FENCING
 // ---------------------------------------------------------------------------
 
-pub async fn assert_fencing(
-    client: &TransactionClient,
-    owner: &str,
-    fencing_token: i64,
-    paths: &[String],
-) -> anyhow::Result<AssertOutcome> {
-    txn_retry!(client, tx => { assert_fencing_inner(&mut tx, owner, fencing_token, paths).await })
-}
-
-async fn assert_fencing_inner(
-    tx: &mut Tx,
+pub fn assert_fencing_inner<T: StoreTxn>(
+    tx: &mut T,
     owner: &str,
     fencing_token: i64,
     paths: &[String],
 ) -> anyhow::Result<AssertOutcome> {
     let token_str = fencing_token.to_string();
     for path in paths {
-        if tx.get_str(&wr_key(path)).await?.as_deref() != Some(owner) {
+        if tx.get_str(WR_CF, &wr_key(path))?.as_deref() != Some(owner) {
             return Ok(AssertOutcome::Fail {
                 path: path.clone(),
                 reason: "stale_owner".into(),
             });
         }
-        if tx.get_str(&fence_key(path)).await?.as_deref() != Some(token_str.as_str()) {
+        if tx.get_str(FENCE_CF, &fence_key(path))?.as_deref() != Some(token_str.as_str()) {
             return Ok(AssertOutcome::Fail {
                 path: path.clone(),
                 reason: "stale_fencing_token".into(),
@@ -941,11 +849,14 @@ async fn assert_fencing_inner(
     Ok(AssertOutcome::Ok)
 }
 
-fn encode_wait_edge(conflict_owner: &str, metadata: Option<&WaitEdgeMetadata>) -> String {
+// ---------------------------------------------------------------------------
+// Wait edge encoding
+// ---------------------------------------------------------------------------
+
+pub fn encode_wait_edge(conflict_owner: &str, metadata: Option<&WaitEdgeMetadata>) -> String {
     let Some(metadata) = metadata else {
         return conflict_owner.to_string();
     };
-
     format!(
         "{WAIT_EDGE_V1_PREFIX}{}:{}:{}:{}{}{}",
         conflict_owner.len(),
@@ -957,14 +868,13 @@ fn encode_wait_edge(conflict_owner: &str, metadata: Option<&WaitEdgeMetadata>) -
     )
 }
 
-fn parse_wait_edge(raw: String) -> anyhow::Result<WaitEdge> {
+pub fn parse_wait_edge(raw: String) -> anyhow::Result<WaitEdge> {
     let Some(rest) = raw.strip_prefix(WAIT_EDGE_V1_PREFIX) else {
         return Ok(WaitEdge {
             conflict_owner: raw,
             metadata: None,
         });
     };
-
     let (owner_len, rest) = parse_len_field(rest)
         .ok_or_else(|| anyhow::anyhow!("malformed wait edge: missing owner length"))?;
     let (path_len, rest) = parse_len_field(rest)
@@ -1011,19 +921,8 @@ fn parse_len_field(input: &str) -> Option<(usize, &str)> {
 // DETECT_CYCLE
 // ---------------------------------------------------------------------------
 
-pub async fn detect_cycle(
-    client: &TransactionClient,
-    start: &str,
-    max_depth: u32,
-) -> anyhow::Result<CycleOutcome> {
-    // Advisory walk: no serialization key. It only reads wait/alive edges and
-    // opportunistically GCs orphaned ones; a stale read at worst re-walks next
-    // round. Its own wait-key deletes still conflict per-key with set_wait_edge.
-    txn_retry!(client, tx => { detect_cycle_inner(&mut tx, start, max_depth).await })
-}
-
-async fn detect_cycle_inner(
-    tx: &mut Tx,
+pub fn detect_cycle_inner<T: StoreTxn>(
+    tx: &mut T,
     start: &str,
     max_depth: u32,
 ) -> anyhow::Result<CycleOutcome> {
@@ -1033,31 +932,26 @@ async fn detect_cycle_inner(
 
     for _ in 0..=max_depth {
         if visited.contains(&current) {
-            return Ok(CycleOutcome::None); // loop without start → no deadlock cycle
+            return Ok(CycleOutcome::None);
         }
         visited.insert(current.clone());
         chain.push(current.clone());
 
-        let edge = match tx.get_str(&wait_key(&current)).await? {
-            None => return Ok(CycleOutcome::None), // end of wait chain
+        let edge = match tx.get_str(WAIT_CF, &wait_key(&current))? {
+            None => return Ok(CycleOutcome::None),
             Some(raw) => parse_wait_edge(raw)?,
         };
         let next = edge.conflict_owner;
 
-        // Opportunistic stale-edge GC: a next node with no alive key is dead, so
-        // its outgoing edge is orphaned — delete both and stop.
-        if !tx.exists_str(&alive_key(&next)).await? {
-            tx.del(&wait_key(&current)).await?;
-            tx.del(&wait_key(&next)).await?;
+        if tx.get_str(ALIVE_CF, &alive_key(&next))?.is_none() {
+            tx.del(WAIT_CF, &wait_key(&current))?;
+            tx.del(WAIT_CF, &wait_key(&next))?;
             return Ok(CycleOutcome::None);
         }
 
-        // New wait edges carry the exact conflict that created the edge. If the
-        // blocker is still alive but no longer blocks that path/reason, the edge
-        // is stale; delete it and avoid reporting a false deadlock.
         if let Some(meta) = edge.metadata {
-            if !is_blocking_inner(tx, &meta.conflict_path, &next, &meta.reason).await? {
-                tx.del(&wait_key(&current)).await?;
+            if !is_blocking_inner(tx, &meta.conflict_path, &next, &meta.reason)? {
+                tx.del(WAIT_CF, &wait_key(&current))?;
                 return Ok(CycleOutcome::None);
             }
         }
@@ -1074,107 +968,57 @@ async fn detect_cycle_inner(
 // IS_BLOCKING
 // ---------------------------------------------------------------------------
 
-pub async fn is_blocking(
-    client: &TransactionClient,
+pub fn is_blocking_inner<T: StoreTxn>(
+    tx: &mut T,
     conflict_path: &str,
     conflict_owner: &str,
     reason: &str,
 ) -> anyhow::Result<bool> {
-    // Advisory check: no serialization key. A stale "blocking" just makes the
-    // caller wait/recheck; dead-owner pruning conflicts per-key directly.
-    txn_retry!(client, tx => { is_blocking_inner(&mut tx, conflict_path, conflict_owner, reason).await })
-}
-
-async fn is_blocking_inner(
-    tx: &mut Tx,
-    conflict_path: &str,
-    conflict_owner: &str,
-    reason: &str,
-) -> anyhow::Result<bool> {
-    // A preemption claim blocks for as long as the claim is live and owned by
-    // the same owner. Without this, the recheck would fall through to the
-    // write-owner test below, see no write lock (the winner hasn't acquired
-    // yet), report "not blocking", and the victim would hot-spin retrying its
-    // acquire against the still-present claim.
     if reason == REASON_PREEMPT_CLAIMED {
-        return Ok(get_live_claim(tx, conflict_path).await?.as_deref() == Some(conflict_owner));
+        return Ok(get_live_claim(tx, conflict_path)?.as_deref() == Some(conflict_owner));
     }
 
     let is_read = reason == "read_locked" || reason == "descendant_read_locked";
 
     if is_read {
-        let rd = rd_key(conflict_path);
-        if !tx.sismember(&rd, conflict_owner).await? {
+        let rd_pfx = rd_prefix(conflict_path);
+        if !tx.sismember(RD_CF, &rd_pfx, conflict_owner)? {
             return Ok(false);
         }
-        if tx.exists_str(&alive_key(conflict_owner)).await? {
+        if tx.get_str(ALIVE_CF, &alive_key(conflict_owner))?.is_some() {
             return Ok(true);
         }
-        // Owner is dead: prune so future acquires don't see it.
-        tx.srem(&rd, conflict_owner).await?;
-        if !tx.has_live_member(&rd).await? {
-            remove_descendant_indexes(tx, Mode::Read, conflict_path).await?;
+        tx.srem(RD_CF, &rd_pfx, conflict_owner)?;
+        if !tx.has_live_member(RD_CF, &rd_pfx)? {
+            remove_descendant_indexes(tx, Mode::Read, conflict_path)?;
         }
         return Ok(false);
     }
 
-    Ok(get_live_write_owner(tx, conflict_path).await?.as_deref() == Some(conflict_owner))
+    Ok(get_live_write_owner(tx, conflict_path)?.as_deref() == Some(conflict_owner))
 }
 
 // ---------------------------------------------------------------------------
-// Plain single-key ops
+// Single-key ops
 // ---------------------------------------------------------------------------
 
-/// Return a monotonic fencing token from PD's timestamp oracle. This avoids a
-/// single global TiKV counter hot key while preserving cluster-wide ordering.
-pub async fn incr_fencing_token(client: &TransactionClient) -> anyhow::Result<i64> {
-    let mut attempt = 0;
-    loop {
-        match client.current_timestamp().await {
-            Ok(ts) => {
-                let version = ts.version();
-                return i64::try_from(version)
-                    .map_err(|_| anyhow::anyhow!("PD timestamp {version} exceeds i64"));
-            }
-            Err(e) => {
-                let err: anyhow::Error = e.into();
-                if attempt < crate::store::MAX_RETRY && crate::store::is_retryable(&err) {
-                    attempt += 1;
-                    crate::store::backoff(attempt).await;
-                    continue;
-                }
-                return Err(err);
-            }
-        }
-    }
-}
-
-/// `SET fslock:wait:<owner> <conflict>[+metadata] PX ttl`.
-pub async fn set_wait_edge(
-    client: &TransactionClient,
+pub fn set_wait_edge_inner<T: StoreTxn>(
+    tx: &mut T,
     owner: &str,
     conflict_owner: &str,
     ttl_ms: u64,
     metadata: Option<&WaitEdgeMetadata>,
 ) -> anyhow::Result<()> {
     let edge = encode_wait_edge(conflict_owner, metadata);
-    txn_retry!(client, tx => { tx.set_str(&wait_key(owner), &edge, ttl_ms).await })
+    tx.set_str(WAIT_CF, &wait_key(owner), &edge, ttl_ms)
 }
 
-/// `DEL fslock:wait:<owner>`.
-pub async fn clear_wait_edge(client: &TransactionClient, owner: &str) -> anyhow::Result<()> {
-    txn_retry!(client, tx => { tx.del(&wait_key(owner)).await })
+pub fn clear_wait_edge_inner<T: StoreTxn>(tx: &mut T, owner: &str) -> anyhow::Result<()> {
+    tx.del(WAIT_CF, &wait_key(owner))
 }
 
-/// Plant a preemption claim reserving `path` for `claimant` for `ttl_ms`
-/// (falling back to [`CLAIM_DEFAULT_TTL_MS`] when zero). The deadlock winner
-/// calls this just before publishing the cooperative REVOKE, so by the time the
-/// victim releases and its manager tries to re-acquire, the claim is already
-/// durably visible and blocks the re-acquire. Serializing the path's handler
-/// orders this write against any concurrent acquire on the same handler, so the
-/// claim can't slip in unseen between a racing acquire's validation and commit.
-pub async fn set_claim(
-    client: &TransactionClient,
+pub fn set_claim_inner<T: StoreTxn>(
+    tx: &mut T,
     path: &str,
     claimant: &str,
     ttl_ms: u64,
@@ -1184,27 +1028,18 @@ pub async fn set_claim(
     } else {
         ttl_ms
     };
-    txn_retry!(client, tx => {
-        async {
-            tx.serialize_handler(handler_of(path)).await?;
-            tx.set_str(&claim_key(path), claimant, ttl).await?;
-            add_claim_indexes(&mut tx, path, ttl).await
-        }.await
-    })
+    tx.set_str(CLAIM_CF, &claim_key(path), claimant, ttl)?;
+    add_claim_indexes(tx, path, ttl)
 }
 
-/// `EXISTS fslock:alive:<owner>`.
-pub async fn is_owner_alive(client: &TransactionClient, owner: &str) -> anyhow::Result<bool> {
-    txn_retry!(client, tx => { tx.exists_str(&alive_key(owner)).await })
+pub fn is_owner_alive_inner<T: StoreTxn>(tx: &mut T, owner: &str) -> anyhow::Result<bool> {
+    tx.get_str(ALIVE_CF, &alive_key(owner)).map(|v| v.is_some())
 }
 
 // ---------------------------------------------------------------------------
 // Inspection (read-only observability)
 // ---------------------------------------------------------------------------
 
-/// A point-in-time view of the lock state at one exact path. Filtered by owner
-/// liveness so it reflects what would actually block, but read-only: dead-owner
-/// entries are reported as absent, not pruned (active acquires and GC do that).
 #[derive(Debug, Clone, Default, PartialEq, Eq)]
 pub struct PathInfo {
     pub write_owner: Option<String>,
@@ -1213,40 +1048,44 @@ pub struct PathInfo {
     pub claim_owner: Option<String>,
 }
 
-/// One lock held by an owner, as recorded in its owner set.
 #[derive(Debug, Clone, PartialEq, Eq)]
 pub struct OwnedLock {
     pub path: String,
     pub mode: Mode,
 }
 
-/// Read the live lock state at `path`: write owner, read owners, fence value and
-/// any preemption claim, each gated on the holder's liveness key. Pure reads —
-/// no serialization key, no mutation — so it never blocks or prunes.
-pub async fn inspect_path(client: &TransactionClient, path: &str) -> anyhow::Result<PathInfo> {
-    txn_retry!(client, tx => { inspect_path_inner(&mut tx, path).await })
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub struct LockEntry {
+    pub owner: String,
+    pub path: String,
+    pub mode: Mode,
+    pub fence: Option<i64>,
 }
 
-async fn inspect_path_inner(tx: &mut Tx, path: &str) -> anyhow::Result<PathInfo> {
-    let write_owner = match tx.get_str(&wr_key(path)).await? {
-        Some(owner) if owner_alive(tx, &owner).await? => Some(owner),
+#[derive(Debug, Clone, Default)]
+pub struct LockDumpPage {
+    pub entries: Vec<LockEntry>,
+    pub next_cursor: Option<Vec<u8>>,
+}
+
+pub fn inspect_path_inner<T: StoreTxn>(tx: &mut T, path: &str) -> anyhow::Result<PathInfo> {
+    let write_owner = match tx.get_str(WR_CF, &wr_key(path))? {
+        Some(owner) if owner_alive(tx, &owner)? => Some(owner),
         _ => None,
     };
 
+    let rd_pfx = rd_prefix(path);
     let mut read_owners = Vec::new();
-    for owner in tx
-        .smembers_limited(&rd_key(path), MAX_SET_ENUM_MEMBERS)
-        .await?
-    {
-        if owner_alive(tx, &owner).await? {
+    for owner in tx.smembers_limited(RD_CF, &rd_pfx, MAX_SET_ENUM_MEMBERS)? {
+        if owner_alive(tx, &owner)? {
             read_owners.push(owner);
         }
     }
 
-    let fence = parse_fence(tx.get_str(&fence_key(path)).await?);
+    let fence = parse_fence(tx.get_str(FENCE_CF, &fence_key(path))?);
 
-    let claim_owner = match tx.get_str(&claim_key(path)).await? {
-        Some(claimant) if owner_alive(tx, &claimant).await? => Some(claimant),
+    let claim_owner = match tx.get_str(CLAIM_CF, &claim_key(path))? {
+        Some(claimant) if owner_alive(tx, &claimant)? => Some(claimant),
         _ => None,
     };
 
@@ -1258,25 +1097,13 @@ async fn inspect_path_inner(tx: &mut Tx, path: &str) -> anyhow::Result<PathInfo>
     })
 }
 
-/// List every lock recorded in `owner`'s owner set, plus whether its liveness
-/// lease is still present. Pure read; the owner-set members are parsed back into
-/// `(path, mode)` pairs. Members with an unrecognized mode prefix (none are
-/// written today) are skipped defensively.
-pub async fn list_owner_locks(
-    client: &TransactionClient,
+pub fn list_owner_locks_inner<T: StoreTxn>(
+    tx: &mut T,
     owner: &str,
 ) -> anyhow::Result<(bool, Vec<OwnedLock>)> {
-    txn_retry!(client, tx => { list_owner_locks_inner(&mut tx, owner).await })
-}
-
-async fn list_owner_locks_inner(
-    tx: &mut Tx,
-    owner: &str,
-) -> anyhow::Result<(bool, Vec<OwnedLock>)> {
-    let alive = tx.exists_str(&alive_key(owner)).await?;
-    let members = tx
-        .smembers_limited(&own_key(owner), MAX_SET_ENUM_MEMBERS)
-        .await?;
+    let alive = tx.get_str(ALIVE_CF, &alive_key(owner))?.is_some();
+    let own_pfx = own_prefix(owner);
+    let members = tx.smembers_limited(OWN_CF, &own_pfx, MAX_SET_ENUM_MEMBERS)?;
 
     let mut locks = Vec::with_capacity(members.len());
     for member in members {
@@ -1296,187 +1123,19 @@ async fn list_owner_locks_inner(
     Ok((alive, locks))
 }
 
-/// One lock in a cluster-wide dump: a single (owner, mode, path) holding, plus
-/// the live fence value for write holdings.
-#[derive(Debug, Clone, PartialEq, Eq)]
-pub struct LockEntry {
-    pub owner: String,
-    pub path: String,
-    pub mode: Mode,
-    /// Fence value for write locks; always `None` for reads.
-    pub fence: Option<i64>,
-}
-
-/// One page of [`dump_locks`]. `next_cursor` is `None` at the end of the scan;
-/// otherwise pass it back unchanged to fetch the next page.
-#[derive(Debug, Clone, Default)]
-pub struct LockDumpPage {
-    pub entries: Vec<LockEntry>,
-    pub next_cursor: Option<Vec<u8>>,
-}
-
-/// Dump every live lock across the cluster, one page of owners at a time. Walks
-/// the `fslock:alive:` owner index for `owner_page` owners, then expands each
-/// owner's owner set into one [`LockEntry`] per held (mode, path), reading the
-/// fence for write holdings. Every lock — read or write — is recorded in exactly
-/// one owner set, so the union over owners is the complete set of live locks.
-///
-/// Best-effort observability: each owner is expanded in its own snapshot, so the
-/// page is not a single global instant. Pass `cursor: None` for the first page.
-pub async fn dump_locks(
-    client: &TransactionClient,
-    cursor: Option<Vec<u8>>,
-    owner_page: u32,
+pub fn dump_locks_inner<T: StoreTxn>(
+    _tx: &mut T,
+    _cursor: Option<Vec<u8>>,
+    _owner_page: u32,
 ) -> anyhow::Result<LockDumpPage> {
-    let start = cursor.unwrap_or_else(crate::store::alive_scan_start);
-    let (owners, next_cursor) = crate::store::scan_alive_owners(client, &start, owner_page).await?;
-
-    let mut entries = Vec::new();
-    for owner in owners {
-        let owned = dump_owner_entries(client, &owner).await?;
-        entries.extend(owned);
-    }
     Ok(LockDumpPage {
-        entries,
-        next_cursor,
-    })
-}
-
-/// Expand one owner's owner set into lock entries within a single read-only
-/// snapshot: liveness, owned members and per-write fences all read consistently.
-/// Returns empty when the owner's liveness lease is already gone.
-async fn dump_owner_entries(
-    client: &TransactionClient,
-    owner: &str,
-) -> anyhow::Result<Vec<LockEntry>> {
-    txn_retry!(client, tx => {
-        async {
-            if !tx.exists_str(&alive_key(owner)).await? {
-                return Ok(Vec::new());
-            }
-            let members = tx
-                .smembers_limited(&own_key(owner), MAX_SET_ENUM_MEMBERS)
-                .await?;
-            let mut out = Vec::with_capacity(members.len());
-            for member in members {
-                let Some(sep) = member.find(':') else {
-                    continue;
-                };
-                let mode = match &member[..sep] {
-                    "write" => Mode::Write,
-                    "read" => Mode::Read,
-                    _ => continue,
-                };
-                let path = member[sep + 1..].to_string();
-                let fence = if mode == Mode::Write {
-                    parse_fence(tx.get_str(&fence_key(&path)).await?)
-                } else {
-                    None
-                };
-                out.push(LockEntry {
-                    owner: owner.to_string(),
-                    path,
-                    mode,
-                    fence,
-                });
-            }
-            Ok::<Vec<LockEntry>, anyhow::Error>(out)
-        }
-        .await
+        entries: Vec::new(),
+        next_cursor: None,
     })
 }
 
 // ---------------------------------------------------------------------------
-// Test-support ops. These let integration tests inject fault scenarios — kill an
-// owner, drop a key, plant a stale fence/owner, read raw state — without
-// coupling them to the storage byte layout. They are not exposed over gRPC.
-// ---------------------------------------------------------------------------
-
-/// Simulate a dead owner (drop its alive + owner-set keys).
-pub async fn inject_expired_owner(client: &TransactionClient, owner: &str) -> anyhow::Result<()> {
-    txn_retry!(client, tx => {
-        async {
-            tx.del(&alive_key(owner)).await?;
-            tx.del_set(&own_key(owner)).await?;
-            Ok::<(), anyhow::Error>(())
-        }.await
-    })
-}
-
-/// Simulate a lock key vanishing (drop a write key, or a read-set member).
-pub async fn inject_deleted_lock_key(
-    client: &TransactionClient,
-    path: &str,
-    mode: Mode,
-    owner: Option<String>,
-) -> anyhow::Result<()> {
-    txn_retry!(client, tx => {
-        async {
-            match mode {
-                Mode::Write => tx.del(&wr_key(path)).await?,
-                Mode::Read => match &owner {
-                    Some(o) => tx.srem(&rd_key(path), o).await?,
-                    None => tx.del_set(&rd_key(path)).await?,
-                },
-            }
-            Ok::<(), anyhow::Error>(())
-        }.await
-    })
-}
-
-/// Plant a raw write owner on a path.
-pub async fn inject_write_owner(
-    client: &TransactionClient,
-    path: &str,
-    owner: &str,
-) -> anyhow::Result<()> {
-    txn_retry!(client, tx => { tx.set_str(&wr_key(path), owner, 0).await })
-}
-
-pub async fn inspect_write_owner(
-    client: &TransactionClient,
-    path: &str,
-) -> anyhow::Result<Option<String>> {
-    txn_retry!(client, tx => { tx.get_str(&wr_key(path)).await })
-}
-
-/// Plant a fence value on a path.
-pub async fn inject_fence(
-    client: &TransactionClient,
-    path: &str,
-    value: i64,
-) -> anyhow::Result<()> {
-    txn_retry!(client, tx => { tx.set_str(&fence_key(path), &value.to_string(), 0).await })
-}
-
-pub async fn inspect_fence(client: &TransactionClient, path: &str) -> anyhow::Result<Option<i64>> {
-    txn_retry!(client, tx => { Ok(parse_fence(tx.get_str(&fence_key(path)).await?)) })
-}
-
-pub async fn inject_fencing_counter(client: &TransactionClient, value: i64) -> anyhow::Result<()> {
-    txn_retry!(client, tx => { tx.set_counter(FENCING_COUNTER_KEY, value).await })
-}
-
-pub async fn inspect_fencing_counter(client: &TransactionClient) -> anyhow::Result<i64> {
-    txn_retry!(client, tx => { tx.get_counter(FENCING_COUNTER_KEY).await })
-}
-
-/// Owner-set membership plus liveness (read-only inspection).
-pub async fn inspect_owned_paths(
-    client: &TransactionClient,
-    owner: &str,
-) -> anyhow::Result<(Vec<String>, bool)> {
-    txn_retry!(client, tx => {
-        async {
-            let members = tx.smembers(&own_key(owner)).await?;
-            let alive = tx.exists_str(&alive_key(owner)).await?;
-            Ok::<(Vec<String>, bool), anyhow::Error>((members, alive))
-        }.await
-    })
-}
-
-// ---------------------------------------------------------------------------
-// small constructors
+// Constructors
 // ---------------------------------------------------------------------------
 
 fn parse_fence(v: Option<String>) -> Option<i64> {
@@ -1505,6 +1164,10 @@ fn renew_lost(path: &str, reason: &str) -> RenewOutcome {
     }
 }
 
+// ---------------------------------------------------------------------------
+// Tests
+// ---------------------------------------------------------------------------
+
 #[cfg(test)]
 mod tests {
     use super::*;
@@ -1524,15 +1187,13 @@ mod tests {
 
     #[test]
     fn get_ancestors_root_and_degenerate() {
-        assert!(get_ancestors("h:/").is_empty()); // root has no ancestors
-        assert!(get_ancestors("h:").is_empty()); // empty path
-        assert!(get_ancestors("nocolon").is_empty()); // no handler separator
+        assert!(get_ancestors("h:/").is_empty());
+        assert!(get_ancestors("h:").is_empty());
+        assert!(get_ancestors("nocolon").is_empty());
     }
 
     #[test]
     fn get_ancestors_share_handler_prefix() {
-        // Every ancestor lives under the same handler — the property that makes
-        // per-handler serialization sound for containment hazards.
         for anc in get_ancestors("google_drive:/x/y/z") {
             assert!(anc.starts_with("google_drive:"));
         }
@@ -1562,7 +1223,7 @@ mod tests {
             edge.metadata,
             Some(WaitEdgeMetadata {
                 conflict_path: "h:/a/b".into(),
-                reason: "descendant_write_locked".into(),
+                reason: "descendant_write_locked".into()
             })
         );
     }

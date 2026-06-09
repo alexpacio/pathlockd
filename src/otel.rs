@@ -1,14 +1,14 @@
 //! OpenTelemetry setup and gRPC request instrumentation.
 //!
-//! OTLP targets are intentionally configured through the standard `OTEL_*`
-//! environment variables so deployments can point traces and metrics at an APM
-//! backend without adding pathlockd-specific config keys.
+//! OTLP targets are configured through the standard `OTEL_*` environment variables
+//! so deployments can point traces and metrics at an APM backend without adding
+//! pathlockd-specific config keys.
 
 use std::future::Future;
 use std::sync::OnceLock;
 use std::time::{Duration, Instant};
 
-use opentelemetry::metrics::{Counter, Gauge, Histogram};
+use opentelemetry::metrics::{Counter, Histogram};
 use opentelemetry::propagation::Extractor;
 use opentelemetry::trace::TracerProvider as _;
 use opentelemetry::{global, KeyValue};
@@ -36,31 +36,19 @@ pub struct TelemetryGuard {
 }
 
 impl TelemetryGuard {
-    pub fn traces_enabled(&self) -> bool {
-        self.tracer_provider.is_some()
-    }
-
-    pub fn metrics_enabled(&self) -> bool {
-        self.meter_provider.is_some()
-    }
+    pub fn traces_enabled(&self) -> bool { self.tracer_provider.is_some() }
+    pub fn metrics_enabled(&self) -> bool { self.meter_provider.is_some() }
 
     pub fn shutdown(&self) -> anyhow::Result<()> {
         let mut errors = Vec::new();
-        if let Some(provider) = &self.tracer_provider {
-            if let Err(e) = provider.shutdown() {
-                errors.push(format!("traces: {e}"));
-            }
+        if let Some(p) = &self.tracer_provider {
+            if let Err(e) = p.shutdown() { errors.push(format!("traces: {e}")); }
         }
-        if let Some(provider) = &self.meter_provider {
-            if let Err(e) = provider.shutdown() {
-                errors.push(format!("metrics: {e}"));
-            }
+        if let Some(p) = &self.meter_provider {
+            if let Err(e) = p.shutdown() { errors.push(format!("metrics: {e}")); }
         }
-        if errors.is_empty() {
-            Ok(())
-        } else {
-            anyhow::bail!("OpenTelemetry shutdown failed: {}", errors.join("; "))
-        }
+        if errors.is_empty() { Ok(()) }
+        else { anyhow::bail!("OpenTelemetry shutdown failed: {}", errors.join("; ")) }
     }
 }
 
@@ -71,19 +59,12 @@ pub fn init(log_level: &str) -> anyhow::Result<TelemetryGuard> {
     let fmt_layer = tracing_subscriber::fmt::layer();
 
     if sdk_disabled() {
-        tracing_subscriber::registry()
-            .with(filter)
-            .with(fmt_layer)
-            .try_init()?;
+        tracing_subscriber::registry().with(filter).with(fmt_layer).try_init()?;
         return Ok(TelemetryGuard::default());
     }
 
-    let traces_enabled =
-        signal_enabled("OTEL_TRACES_EXPORTER", "OTEL_EXPORTER_OTLP_TRACES_ENDPOINT");
-    let metrics_enabled = signal_enabled(
-        "OTEL_METRICS_EXPORTER",
-        "OTEL_EXPORTER_OTLP_METRICS_ENDPOINT",
-    );
+    let traces_enabled = signal_enabled("OTEL_TRACES_EXPORTER", "OTEL_EXPORTER_OTLP_TRACES_ENDPOINT");
+    let metrics_enabled = signal_enabled("OTEL_METRICS_EXPORTER", "OTEL_EXPORTER_OTLP_METRICS_ENDPOINT");
     let resource = resource();
 
     let tracer_provider = if traces_enabled {
@@ -107,22 +88,12 @@ pub fn init(log_level: &str) -> anyhow::Result<TelemetryGuard> {
     if let Some(provider) = &tracer_provider {
         let tracer = provider.tracer(INSTRUMENTATION_NAME);
         let otel_layer = tracing_opentelemetry::layer().with_tracer(tracer);
-        tracing_subscriber::registry()
-            .with(filter)
-            .with(fmt_layer)
-            .with(otel_layer)
-            .try_init()?;
+        tracing_subscriber::registry().with(filter).with(fmt_layer).with(otel_layer).try_init()?;
     } else {
-        tracing_subscriber::registry()
-            .with(filter)
-            .with(fmt_layer)
-            .try_init()?;
+        tracing_subscriber::registry().with(filter).with(fmt_layer).try_init()?;
     }
 
-    Ok(TelemetryGuard {
-        tracer_provider,
-        meter_provider,
-    })
+    Ok(TelemetryGuard { tracer_provider, meter_provider })
 }
 
 pub async fn observe_rpc<Req, Resp, Fut, Handler>(
@@ -158,47 +129,8 @@ pub fn record_gc_sweep(reclaimed: u64, elapsed: Duration, success: bool) {
     if let Some(metrics) = METRICS.get() {
         let attrs = [KeyValue::new("success", success)];
         metrics.gc_sweeps.add(1, &attrs);
-        metrics
-            .gc_duration_ms
-            .record(elapsed.as_secs_f64() * 1000.0, &attrs);
-        if reclaimed > 0 {
-            metrics.gc_reclaimed.add(reclaimed, &attrs);
-        }
-    }
-}
-
-/// Record chunks the GC sweep skipped after a delete error (it continued past
-/// them). A non-zero value means orphaned/poisoned keys are being worked around;
-/// the stale-lock resolver and next sweep are the backstops.
-pub fn record_gc_skipped_chunks(n: u64) {
-    if n == 0 {
-        return;
-    }
-    if let Some(metrics) = METRICS.get() {
-        metrics.gc_skipped_chunks.add(n, &[]);
-    }
-}
-
-/// Record stranded transaction locks rolled back by the stale-lock resolver.
-pub fn record_stale_locks_resolved(n: u64) {
-    if n == 0 {
-        return;
-    }
-    if let Some(metrics) = METRICS.get() {
-        metrics.stale_locks_resolved.add(n, &[]);
-    }
-}
-
-/// Publish the live-lock census (sampled each logical GC sweep) as a per-class
-/// gauge. Every class is reported every call — including zeros — so a class that
-/// drains to empty reads as 0 instead of holding its last value.
-pub fn record_lock_census(census: &crate::store::LockCensus) {
-    if let Some(metrics) = METRICS.get() {
-        for (class, count) in census.class_counts() {
-            metrics
-                .live_locks
-                .record(count, &[KeyValue::new("class", class)]);
-        }
+        metrics.gc_duration_ms.record(elapsed.as_secs_f64() * 1000.0, &attrs);
+        if reclaimed > 0 { metrics.gc_reclaimed.add(reclaimed, &attrs); }
     }
 }
 
@@ -206,20 +138,14 @@ fn build_tracer_provider(resource: Resource) -> anyhow::Result<SdkTracerProvider
     let exporter = opentelemetry_otlp::SpanExporter::builder()
         .build()
         .map_err(|e| anyhow::anyhow!("building OTLP trace exporter: {e}"))?;
-    Ok(SdkTracerProvider::builder()
-        .with_resource(resource)
-        .with_batch_exporter(exporter)
-        .build())
+    Ok(SdkTracerProvider::builder().with_resource(resource).with_batch_exporter(exporter).build())
 }
 
 fn build_meter_provider(resource: Resource) -> anyhow::Result<SdkMeterProvider> {
     let exporter = opentelemetry_otlp::MetricExporter::builder()
         .build()
         .map_err(|e| anyhow::anyhow!("building OTLP metrics exporter: {e}"))?;
-    Ok(SdkMeterProvider::builder()
-        .with_resource(resource)
-        .with_periodic_exporter(exporter)
-        .build())
+    Ok(SdkMeterProvider::builder().with_resource(resource).with_periodic_exporter(exporter).build())
 }
 
 fn resource() -> Resource {
@@ -233,62 +159,32 @@ fn resource() -> Resource {
 }
 
 fn signal_enabled(exporter_key: &str, endpoint_key: &str) -> bool {
-    if exporter_is_none(exporter_key) {
-        return false;
-    }
+    if exporter_is_none(exporter_key) { return false; }
     otlp_endpoint_configured(endpoint_key) || exporter_requests_otlp(exporter_key)
 }
 
-fn otlp_endpoint_configured(signal_endpoint_key: &str) -> bool {
-    env_string("OTEL_EXPORTER_OTLP_ENDPOINT").is_some() || env_string(signal_endpoint_key).is_some()
+fn otlp_endpoint_configured(key: &str) -> bool {
+    env_string("OTEL_EXPORTER_OTLP_ENDPOINT").is_some() || env_string(key).is_some()
 }
 
 fn exporter_requests_otlp(key: &str) -> bool {
-    env_string(key)
-        .map(|value| {
-            value
-                .split(',')
-                .any(|part| part.trim().eq_ignore_ascii_case("otlp"))
-        })
-        .unwrap_or(false)
+    env_string(key).map(|value| value.split(',').any(|part| part.trim().eq_ignore_ascii_case("otlp"))).unwrap_or(false)
 }
 
 fn exporter_is_none(key: &str) -> bool {
-    env_string(key)
-        .map(|value| {
-            value
-                .split(',')
-                .all(|part| part.trim().eq_ignore_ascii_case("none"))
-        })
-        .unwrap_or(false)
+    env_string(key).map(|value| value.split(',').all(|part| part.trim().eq_ignore_ascii_case("none"))).unwrap_or(false)
 }
 
 fn sdk_disabled() -> bool {
-    env_string("OTEL_SDK_DISABLED")
-        .map(|value| {
-            matches!(
-                value.trim().to_ascii_lowercase().as_str(),
-                "1" | "true" | "yes" | "on"
-            )
-        })
-        .unwrap_or(false)
+    env_string("OTEL_SDK_DISABLED").map(|value| matches!(value.trim().to_ascii_lowercase().as_str(), "1" | "true" | "yes" | "on")).unwrap_or(false)
 }
 
 fn resource_has_service_name() -> bool {
-    env_string("OTEL_RESOURCE_ATTRIBUTES")
-        .map(|attrs| {
-            attrs
-                .split(',')
-                .filter_map(|pair| pair.split_once('='))
-                .any(|(key, _)| key.trim() == "service.name")
-        })
-        .unwrap_or(false)
+    env_string("OTEL_RESOURCE_ATTRIBUTES").map(|attrs| attrs.split(',').filter_map(|pair| pair.split_once('=')).any(|(key, _)| key.trim() == "service.name")).unwrap_or(false)
 }
 
 fn env_string(key: &str) -> Option<String> {
-    std::env::var(key)
-        .ok()
-        .filter(|value| !value.trim().is_empty())
+    std::env::var(key).ok().filter(|value| !value.trim().is_empty())
 }
 
 fn rpc_span(service: &'static str, method: &'static str) -> Span {
@@ -332,12 +228,8 @@ fn record_rpc_metrics(service: &'static str, method: &'static str, code: Code, e
             KeyValue::new("grpc.status_text", grpc_code_name(code)),
         ];
         metrics.rpc_requests.add(1, &attrs);
-        metrics
-            .rpc_duration_ms
-            .record(elapsed.as_secs_f64() * 1000.0, &attrs);
-        if code != Code::Ok {
-            metrics.rpc_errors.add(1, &attrs);
-        }
+        metrics.rpc_duration_ms.record(elapsed.as_secs_f64() * 1000.0, &attrs);
+        if code != Code::Ok { metrics.rpc_errors.add(1, &attrs); }
     }
 }
 
@@ -371,13 +263,10 @@ impl Extractor for MetadataExtractor<'_> {
     }
 
     fn keys(&self) -> Vec<&str> {
-        self.0
-            .keys()
-            .map(|key| match key {
-                KeyRef::Ascii(key) => key.as_str(),
-                KeyRef::Binary(key) => key.as_str(),
-            })
-            .collect()
+        self.0.keys().map(|key| match key {
+            KeyRef::Ascii(key) => key.as_str(),
+            KeyRef::Binary(key) => key.as_str(),
+        }).collect()
     }
 }
 
@@ -388,57 +277,18 @@ struct Metrics {
     gc_sweeps: Counter<u64>,
     gc_reclaimed: Counter<u64>,
     gc_duration_ms: Histogram<f64>,
-    gc_skipped_chunks: Counter<u64>,
-    stale_locks_resolved: Counter<u64>,
-    live_locks: Gauge<u64>,
 }
 
 impl Metrics {
     fn new() -> Self {
         let meter = global::meter(INSTRUMENTATION_NAME);
         Self {
-            rpc_requests: meter
-                .u64_counter("pathlockd.grpc.server.requests")
-                .with_description("Completed gRPC server requests.")
-                .build(),
-            rpc_errors: meter
-                .u64_counter("pathlockd.grpc.server.errors")
-                .with_description("Completed gRPC server requests with non-OK status.")
-                .build(),
-            rpc_duration_ms: meter
-                .f64_histogram("pathlockd.grpc.server.duration")
-                .with_description("gRPC server request duration.")
-                .with_unit("ms")
-                .build(),
-            gc_sweeps: meter
-                .u64_counter("pathlockd.gc.sweeps")
-                .with_description("Completed storage GC sweeps.")
-                .build(),
-            gc_reclaimed: meter
-                .u64_counter("pathlockd.gc.reclaimed")
-                .with_description("Expired keys reclaimed by storage GC.")
-                .build(),
-            gc_duration_ms: meter
-                .f64_histogram("pathlockd.gc.duration")
-                .with_description("Storage GC sweep duration.")
-                .with_unit("ms")
-                .build(),
-            gc_skipped_chunks: meter
-                .u64_counter("pathlockd.gc.skipped_chunks")
-                .with_description("GC chunks skipped after a delete error; the sweep continued.")
-                .build(),
-            stale_locks_resolved: meter
-                .u64_counter("pathlockd.stale_lock.resolved")
-                .with_description(
-                    "Stranded transaction locks rolled back by the stale-lock resolver.",
-                )
-                .build(),
-            live_locks: meter
-                .u64_gauge("pathlockd.locks.live")
-                .with_description(
-                    "Live fslock keys by class (write/read/alive/owner/index/fence/wait/claim/other), sampled each logical GC sweep.",
-                )
-                .build(),
+            rpc_requests: meter.u64_counter("pathlockd.grpc.server.requests").with_description("Completed gRPC server requests.").build(),
+            rpc_errors: meter.u64_counter("pathlockd.grpc.server.errors").with_description("Completed gRPC server requests with non-OK status.").build(),
+            rpc_duration_ms: meter.f64_histogram("pathlockd.grpc.server.duration").with_description("gRPC server request duration.").with_unit("ms").build(),
+            gc_sweeps: meter.u64_counter("pathlockd.gc.sweeps").with_description("Completed storage GC sweeps.").build(),
+            gc_reclaimed: meter.u64_counter("pathlockd.gc.reclaimed").with_description("Expired keys reclaimed by storage GC.").build(),
+            gc_duration_ms: meter.f64_histogram("pathlockd.gc.duration").with_description("Storage GC sweep duration.").with_unit("ms").build(),
         }
     }
 }
