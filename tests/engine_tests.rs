@@ -437,8 +437,6 @@ fn incr_fencing_token_is_monotonic() {
 fn dead_owner_pruning_unblocks_contender() {
     let (db, _dir) = open_temp_db();
     let now = store_keys::now_ms();
-    let expired = now + 60_000;
-
     // Alice locks with 1ms TTL → expires immediately at now + 1
     apply(&db, Command {
         request_id: None, now_ms: now,
@@ -716,4 +714,837 @@ fn expired_read_owner_is_pruned() {
         op: Op::Acquire(acquire_args("bob", 30_000, 1, vec![wr("h:/a")])),
     });
     assert!(matches!(resp, ApplyResponse::Acquire(AcquireOutcome::Ok)));
+}
+
+// ---------------------------------------------------------------------------
+// RedisPathLock parity tests — ancestor / self write blocking for reads
+// ---------------------------------------------------------------------------
+
+#[test]
+fn read_blocked_by_ancestor_write() {
+    let (db, _dir) = open_temp_db();
+    let now = store_keys::now_ms();
+
+    // Alice writes ancestor
+    apply(&db, Command {
+        request_id: None, now_ms: now,
+        op: Op::Acquire(acquire_args("alice", 60_000, 1, vec![wr("h:/a")])),
+    });
+
+    // Bob tries to read a descendant → ancestor write blocks it
+    let resp = apply(&db, Command {
+        request_id: None, now_ms: now + 1,
+        op: Op::Acquire(acquire_args("bob", 30_000, 0, vec![rd("h:/a/b")])),
+    });
+    match resp {
+        ApplyResponse::Acquire(AcquireOutcome::Conflict { path, owner, reason }) => {
+            assert_eq!(path, "h:/a");
+            assert_eq!(owner, "alice");
+            assert_eq!(reason, "ancestor_locked");
+        }
+        other => panic!("expected ancestor_locked, got {:?}", other),
+    }
+}
+
+#[test]
+fn read_blocked_by_self_write() {
+    let (db, _dir) = open_temp_db();
+    let now = store_keys::now_ms();
+
+    // Alice writes a path
+    apply(&db, Command {
+        request_id: None, now_ms: now,
+        op: Op::Acquire(acquire_args("alice", 60_000, 1, vec![wr("h:/a")])),
+    });
+
+    // Bob tries to read the same path → write_locked
+    let resp = apply(&db, Command {
+        request_id: None, now_ms: now + 1,
+        op: Op::Acquire(acquire_args("bob", 30_000, 0, vec![rd("h:/a")])),
+    });
+    match resp {
+        ApplyResponse::Acquire(AcquireOutcome::Conflict { path, owner, reason }) => {
+            assert_eq!(path, "h:/a");
+            assert_eq!(owner, "alice");
+            assert_eq!(reason, "write_locked");
+        }
+        other => panic!("expected write_locked, got {:?}", other),
+    }
+}
+
+// ---------------------------------------------------------------------------
+// Fencing
+// ---------------------------------------------------------------------------
+
+#[test]
+fn new_write_stale_fencing_token_is_rejected() {
+    let (db, _dir) = open_temp_db();
+    let now = store_keys::now_ms();
+
+    // Alice acquires with token 10, 1ms TTL
+    apply(&db, Command {
+        request_id: None, now_ms: now,
+        op: Op::Acquire(acquire_args("alice", 1, 10, vec![wr("h:/a")])),
+    });
+
+    // After Alice's TTL lapses, Bob acquires with token 20 and 1ms TTL.
+    // Both owners and their locks expire, but the fence (24h TTL) outlives them.
+    apply(&db, Command {
+        request_id: None, now_ms: now + 2,
+        op: Op::Acquire(acquire_args("bob", 1, 20, vec![wr("h:/a")])),
+    });
+
+    // After both locks expire, Alice returns with stale token 10.
+    // The write lock is gone, but the fence (set to 20 by Bob) outlasts it.
+    let resp = apply(&db, Command {
+        request_id: None, now_ms: now + 4,
+        op: Op::Acquire(acquire_args("alice", 60_000, 10, vec![wr("h:/a")])),
+    });
+    match resp {
+        ApplyResponse::Acquire(AcquireOutcome::Conflict { reason, .. }) => {
+            assert_eq!(reason, "stale_fencing_token");
+        }
+        other => panic!("expected stale_fencing_token, got {:?}", other),
+    }
+}
+
+// ---------------------------------------------------------------------------
+// Same-owner idempotency
+// ---------------------------------------------------------------------------
+
+#[test]
+fn same_owner_reacquire_is_idempotent() {
+    let (db, _dir) = open_temp_db();
+    let now = store_keys::now_ms();
+
+    // Alice locks
+    apply(&db, Command {
+        request_id: None, now_ms: now,
+        op: Op::Acquire(acquire_args("alice", 60_000, 1, vec![wr("h:/a")])),
+    });
+
+    // Alice re-acquires same lock (as new, not held) — idempotent, no conflict
+    let resp = apply(&db, Command {
+        request_id: None, now_ms: now + 1,
+        op: Op::Acquire(acquire_args("alice", 60_000, 2, vec![wr("h:/a")])),
+    });
+    assert!(matches!(resp, ApplyResponse::Acquire(AcquireOutcome::Ok)));
+}
+
+#[test]
+fn same_owner_read_and_write_same_path() {
+    let (db, _dir) = open_temp_db();
+    let now = store_keys::now_ms();
+
+    // Alice writes
+    apply(&db, Command {
+        request_id: None, now_ms: now,
+        op: Op::Acquire(acquire_args("alice", 60_000, 1, vec![wr("h:/a")])),
+    });
+
+    // Alice also reads — same owner, no conflict
+    let resp = apply(&db, Command {
+        request_id: None, now_ms: now + 1,
+        op: Op::Acquire(acquire_args("alice", 60_000, 0, vec![rd("h:/a")])),
+    });
+    assert!(matches!(resp, ApplyResponse::Acquire(AcquireOutcome::Ok)));
+}
+
+// ---------------------------------------------------------------------------
+// Held-state validation
+// ---------------------------------------------------------------------------
+
+#[test]
+fn held_read_missing_returns_lost() {
+    let (db, _dir) = open_temp_db();
+    let now = store_keys::now_ms();
+
+    // Make Alice alive so the initial alive check passes
+    apply(&db, Command {
+        request_id: None, now_ms: now,
+        op: Op::Acquire(acquire_args("alice", 60_000, 0, vec![rd("h:/unrelated")])),
+    });
+
+    // Alice claims to hold a read on a path she never acquired
+    let resp = apply(&db, Command {
+        request_id: None, now_ms: now + 1,
+        op: Op::Acquire(AcquireArgs {
+            owner_id: "alice".into(), ttl_ms: 60_000, fencing_token: 0,
+            requests: vec![rd_held("h:/a")],
+            release_requests: vec![],
+        }),
+    });
+    match resp {
+        ApplyResponse::Acquire(AcquireOutcome::Lost { path, reason }) => {
+            assert_eq!(path, "h:/a");
+            assert_eq!(reason, "missing_read");
+        }
+        other => panic!("expected Lost missing_read, got {:?}", other),
+    }
+}
+
+#[test]
+fn held_write_with_wrong_owner_returns_lost() {
+    let (db, _dir) = open_temp_db();
+    let now = store_keys::now_ms();
+
+    // Alice acquires
+    apply(&db, Command {
+        request_id: None, now_ms: now,
+        op: Op::Acquire(acquire_args("alice", 60_000, 1, vec![wr("h:/a")])),
+    });
+
+    // Make Bob alive so the initial alive check passes
+    apply(&db, Command {
+        request_id: None, now_ms: now + 1,
+        op: Op::Acquire(acquire_args("bob", 60_000, 2, vec![wr("h:/unrelated")])),
+    });
+
+    // Bob claims to hold Alice's lock
+    let resp = apply(&db, Command {
+        request_id: None, now_ms: now + 2,
+        op: Op::Acquire(AcquireArgs {
+            owner_id: "bob".into(), ttl_ms: 60_000, fencing_token: 3,
+            requests: vec![wr_held("h:/a")],
+            release_requests: vec![],
+        }),
+    });
+    match resp {
+        ApplyResponse::Acquire(AcquireOutcome::Lost { path, reason }) => {
+            assert_eq!(path, "h:/a");
+            assert_eq!(reason, "missing_write");
+        }
+        other => panic!("expected Lost missing_write, got {:?}", other),
+    }
+}
+
+// ---------------------------------------------------------------------------
+// Combined held + new acquire
+// ---------------------------------------------------------------------------
+
+#[test]
+fn combined_held_and_new_in_same_op() {
+    let (db, _dir) = open_temp_db();
+    let now = store_keys::now_ms();
+
+    // Alice holds /a
+    apply(&db, Command {
+        request_id: None, now_ms: now,
+        op: Op::Acquire(acquire_args("alice", 60_000, 1, vec![wr("h:/a")])),
+    });
+
+    // Alice extends /a (held) and acquires /b (new) in one op
+    let args = AcquireArgs {
+        owner_id: "alice".into(), ttl_ms: 60_000, fencing_token: 2,
+        requests: vec![wr_held("h:/a"), wr("h:/b")],
+        release_requests: vec![],
+    };
+    let resp = apply(&db, Command { request_id: None, now_ms: now + 1, op: Op::Acquire(args) });
+    assert!(matches!(resp, ApplyResponse::Acquire(AcquireOutcome::Ok)));
+
+    // Alice now holds both
+    let mut txn = pathlockd::store_rocksdb::RocksDbTxn::new(db.clone(), now + 2);
+    let info_a = pathlockd::engine::inspect_path_inner(&mut txn, "h:/a").unwrap();
+    let info_b = pathlockd::engine::inspect_path_inner(&mut txn, "h:/b").unwrap();
+    assert_eq!(info_a.write_owner.as_deref(), Some("alice"));
+    assert_eq!(info_b.write_owner.as_deref(), Some("alice"));
+}
+
+// ---------------------------------------------------------------------------
+// Cycle detection — edge cases
+// ---------------------------------------------------------------------------
+
+#[test]
+fn detect_cycle_no_cycle_chain() {
+    let (db, _dir) = open_temp_db();
+    let now = store_keys::now_ms();
+
+    // a waits on b, b waits on c — no cycle
+    apply(&db, Command {
+        request_id: None, now_ms: now,
+        op: Op::Acquire(acquire_args("a", 60_000, 1, vec![wr("h:/x")])),
+    });
+    apply(&db, Command {
+        request_id: None, now_ms: now,
+        op: Op::Acquire(acquire_args("b", 60_000, 2, vec![wr("h:/y")])),
+    });
+    apply(&db, Command {
+        request_id: None, now_ms: now,
+        op: Op::Acquire(acquire_args("c", 60_000, 3, vec![wr("h:/z")])),
+    });
+
+    let meta = WaitEdgeMetadata { conflict_path: "h:/x".into(), reason: "write_locked".into() };
+    apply(&db, Command {
+        request_id: None, now_ms: now,
+        op: Op::SetWaitEdge {
+            owner: "a".into(),
+            edge: pathlockd::raft::command::WaitEdge { conflict_owner: "b".into(), metadata: Some(meta.clone()) },
+            ttl_ms: 60_000,
+        },
+    });
+    apply(&db, Command {
+        request_id: None, now_ms: now,
+        op: Op::SetWaitEdge {
+            owner: "b".into(),
+            edge: pathlockd::raft::command::WaitEdge { conflict_owner: "c".into(), metadata: Some(meta) },
+            ttl_ms: 60_000,
+        },
+    });
+
+    let mut txn = pathlockd::store_rocksdb::RocksDbTxn::new(db.clone(), now + 1);
+    let outcome = pathlockd::engine::detect_cycle_inner(&mut txn, "a", 10).unwrap();
+    assert_eq!(outcome, CycleOutcome::None);
+}
+
+#[test]
+fn detect_cycle_truncated_at_max_depth() {
+    let (db, _dir) = open_temp_db();
+    let now = store_keys::now_ms();
+
+    // Build a long chain a→b→c→d, each owner holds the path they block on
+    // a waits for b on h:/x, b waits for c on h:/y, c waits for d on h:/z
+    apply(&db, Command {
+        request_id: None, now_ms: now,
+        op: Op::Acquire(acquire_args("a", 60_000, 1, vec![wr("h:/w")])),
+    });
+    apply(&db, Command {
+        request_id: None, now_ms: now,
+        op: Op::Acquire(acquire_args("b", 60_000, 2, vec![wr("h:/x")])),
+    });
+    apply(&db, Command {
+        request_id: None, now_ms: now,
+        op: Op::Acquire(acquire_args("c", 60_000, 3, vec![wr("h:/y")])),
+    });
+    apply(&db, Command {
+        request_id: None, now_ms: now,
+        op: Op::Acquire(acquire_args("d", 60_000, 4, vec![wr("h:/z")])),
+    });
+
+    // a waits on b (b holds h:/x)
+    apply(&db, Command {
+        request_id: None, now_ms: now,
+        op: Op::SetWaitEdge {
+            owner: "a".into(),
+            edge: pathlockd::raft::command::WaitEdge {
+                conflict_owner: "b".into(),
+                metadata: Some(WaitEdgeMetadata { conflict_path: "h:/x".into(), reason: "write_locked".into() }),
+            },
+            ttl_ms: 60_000,
+        },
+    });
+    // b waits on c (c holds h:/y)
+    apply(&db, Command {
+        request_id: None, now_ms: now,
+        op: Op::SetWaitEdge {
+            owner: "b".into(),
+            edge: pathlockd::raft::command::WaitEdge {
+                conflict_owner: "c".into(),
+                metadata: Some(WaitEdgeMetadata { conflict_path: "h:/y".into(), reason: "write_locked".into() }),
+            },
+            ttl_ms: 60_000,
+        },
+    });
+    // c waits on d (d holds h:/z)
+    apply(&db, Command {
+        request_id: None, now_ms: now,
+        op: Op::SetWaitEdge {
+            owner: "c".into(),
+            edge: pathlockd::raft::command::WaitEdge {
+                conflict_owner: "d".into(),
+                metadata: Some(WaitEdgeMetadata { conflict_path: "h:/z".into(), reason: "write_locked".into() }),
+            },
+            ttl_ms: 60_000,
+        },
+    });
+
+    // Walk with max_depth=2 → truncated at b→c (3 nodes visited but depth 2)
+    let mut txn = pathlockd::store_rocksdb::RocksDbTxn::new(db.clone(), now + 1);
+    let outcome = pathlockd::engine::detect_cycle_inner(&mut txn, "a", 2).unwrap();
+    match outcome {
+        CycleOutcome::Truncated(chain) => {
+            assert_eq!(chain.len(), 3);
+            assert_eq!(chain[0], "a");
+            assert_eq!(chain[1], "b");
+            assert_eq!(chain[2], "c");
+        }
+        other => panic!("expected Truncated, got {:?}", other),
+    }
+}
+
+#[test]
+fn detect_cycle_stale_edge_dead_blocker() {
+    let (db, _dir) = open_temp_db();
+    let now = store_keys::now_ms();
+
+    // a is alive, b is alive (but only briefly with 1ms TTL)
+    apply(&db, Command {
+        request_id: None, now_ms: now,
+        op: Op::Acquire(acquire_args("a", 60_000, 1, vec![wr("h:/x")])),
+    });
+    apply(&db, Command {
+        request_id: None, now_ms: now,
+        op: Op::Acquire(acquire_args("b", 1, 2, vec![wr("h:/y")])),
+    });
+
+    // a waits on b
+    let meta = WaitEdgeMetadata { conflict_path: "h:/y".into(), reason: "write_locked".into() };
+    apply(&db, Command {
+        request_id: None, now_ms: now,
+        op: Op::SetWaitEdge {
+            owner: "a".into(),
+            edge: pathlockd::raft::command::WaitEdge { conflict_owner: "b".into(), metadata: Some(meta) },
+            ttl_ms: 60_000,
+        },
+    });
+
+    // b is dead now, cycle walk should prune the stale edge
+    let mut txn = pathlockd::store_rocksdb::RocksDbTxn::new(db.clone(), now + 2);
+    let outcome = pathlockd::engine::detect_cycle_inner(&mut txn, "a", 10).unwrap();
+    // Edge pruned, b is dead → no cycle
+    assert_eq!(outcome, CycleOutcome::None);
+
+    // Also verify b is no longer alive
+    let mut txn = pathlockd::store_rocksdb::RocksDbTxn::new(db.clone(), now + 3);
+    assert!(!pathlockd::engine::is_owner_alive_inner(&mut txn, "b").unwrap());
+}
+
+// ---------------------------------------------------------------------------
+// is_blocking — full coverage
+// ---------------------------------------------------------------------------
+
+#[test]
+fn is_blocking_descendant_read_locked() {
+    let (db, _dir) = open_temp_db();
+    let now = store_keys::now_ms();
+
+    // Alice reads a descendant
+    apply(&db, Command {
+        request_id: None, now_ms: now,
+        op: Op::Acquire(acquire_args("alice", 60_000, 0, vec![rd("h:/a/b/c")])),
+    });
+
+    let mut txn = pathlockd::store_rocksdb::RocksDbTxn::new(db.clone(), now + 1);
+    assert!(pathlockd::engine::is_blocking_inner(
+        &mut txn, "h:/a/b/c", "alice", "descendant_read_locked"
+    ).unwrap());
+}
+
+#[test]
+fn is_blocking_rejects_wrong_owner() {
+    let (db, _dir) = open_temp_db();
+    let now = store_keys::now_ms();
+
+    apply(&db, Command {
+        request_id: None, now_ms: now,
+        op: Op::Acquire(acquire_args("alice", 60_000, 1, vec![wr("h:/a")])),
+    });
+
+    let mut txn = pathlockd::store_rocksdb::RocksDbTxn::new(db.clone(), now + 1);
+    assert!(!pathlockd::engine::is_blocking_inner(
+        &mut txn, "h:/a", "bob", "write_locked"
+    ).unwrap());
+}
+
+#[test]
+fn is_blocking_dead_owner_prunes_read() {
+    let (db, _dir) = open_temp_db();
+    let now = store_keys::now_ms();
+
+    // Alice reads with 1ms TTL
+    apply(&db, Command {
+        request_id: None, now_ms: now,
+        op: Op::Acquire(acquire_args("alice", 1, 0, vec![rd("h:/a")])),
+    });
+
+    // After TTL, is_blocking should return false (owner dead, pruned)
+    let mut txn = pathlockd::store_rocksdb::RocksDbTxn::new(db.clone(), now + 2);
+    assert!(!pathlockd::engine::is_blocking_inner(
+        &mut txn, "h:/a", "alice", "read_locked"
+    ).unwrap());
+
+    // Also check that the read entry is now gone (pruned)
+    let info = pathlockd::engine::inspect_path_inner(&mut txn, "h:/a").unwrap();
+    assert!(info.read_owners.is_empty());
+}
+
+// ---------------------------------------------------------------------------
+// Preemption claims — extended
+// ---------------------------------------------------------------------------
+
+#[test]
+fn claim_on_ancestor_blocks_descendant_acquire() {
+    let (db, _dir) = open_temp_db();
+    let now = store_keys::now_ms();
+
+    // Make Alice alive
+    apply(&db, Command {
+        request_id: None, now_ms: now,
+        op: Op::Acquire(acquire_args("alice", 60_000, 1, vec![wr("h:/unrelated")])),
+    });
+
+    // Alice claims ancestor
+    apply(&db, Command {
+        request_id: None, now_ms: now,
+        op: Op::SetClaim { path: "h:/a".into(), claimant: "alice".into(), ttl_ms: 5_000 },
+    });
+
+    // Bob acquires a descendant → ancestor claim blocks
+    let resp = apply(&db, Command {
+        request_id: None, now_ms: now + 1,
+        op: Op::Acquire(acquire_args("bob", 30_000, 2, vec![wr("h:/a/b")])),
+    });
+    match resp {
+        ApplyResponse::Acquire(AcquireOutcome::Conflict { reason, .. }) => {
+            assert_eq!(reason, "preempt_claimed");
+        }
+        other => panic!("expected preempt_claimed, got {:?}", other),
+    }
+}
+
+#[test]
+fn claim_on_descendant_blocks_ancestor_write_acquire() {
+    let (db, _dir) = open_temp_db();
+    let now = store_keys::now_ms();
+
+    // Make Alice alive
+    apply(&db, Command {
+        request_id: None, now_ms: now,
+        op: Op::Acquire(acquire_args("alice", 60_000, 1, vec![wr("h:/unrelated")])),
+    });
+
+    // Alice claims a descendant
+    apply(&db, Command {
+        request_id: None, now_ms: now,
+        op: Op::SetClaim { path: "h:/a/b".into(), claimant: "alice".into(), ttl_ms: 5_000 },
+    });
+
+    // Bob acquires ancestor in write mode → descendant claim blocks
+    let resp = apply(&db, Command {
+        request_id: None, now_ms: now + 1,
+        op: Op::Acquire(acquire_args("bob", 30_000, 2, vec![wr("h:/a")])),
+    });
+    match resp {
+        ApplyResponse::Acquire(AcquireOutcome::Conflict { reason, .. }) => {
+            assert_eq!(reason, "preempt_claimed");
+        }
+        other => panic!("expected preempt_claimed, got {:?}", other),
+    }
+}
+
+#[test]
+fn same_owner_claim_consumed_on_acquire() {
+    let (db, _dir) = open_temp_db();
+    let now = store_keys::now_ms();
+
+    // Alice is alive
+    apply(&db, Command {
+        request_id: None, now_ms: now,
+        op: Op::Acquire(acquire_args("alice", 60_000, 1, vec![wr("h:/unrelated")])),
+    });
+
+    // Alice claims /a
+    apply(&db, Command {
+        request_id: None, now_ms: now,
+        op: Op::SetClaim { path: "h:/a".into(), claimant: "alice".into(), ttl_ms: 5_000 },
+    });
+
+    // Alice acquires /a → claim consumed
+    let resp = apply(&db, Command {
+        request_id: None, now_ms: now + 1,
+        op: Op::Acquire(acquire_args("alice", 60_000, 2, vec![wr("h:/a")])),
+    });
+    assert!(matches!(resp, ApplyResponse::Acquire(AcquireOutcome::Ok)));
+
+    // Verify claim is gone
+    let mut txn = pathlockd::store_rocksdb::RocksDbTxn::new(db.clone(), now + 2);
+    let info = pathlockd::engine::inspect_path_inner(&mut txn, "h:/a").unwrap();
+    assert!(info.claim_owner.is_none());
+}
+
+#[test]
+fn dead_claim_does_not_block() {
+    let (db, _dir) = open_temp_db();
+    let now = store_keys::now_ms();
+
+    // Make Alice alive
+    apply(&db, Command {
+        request_id: None, now_ms: now,
+        op: Op::Acquire(acquire_args("alice", 1, 1, vec![wr("h:/unrelated")])),
+    });
+
+    // Alice claims with 1ms TTL
+    apply(&db, Command {
+        request_id: None, now_ms: now,
+        op: Op::SetClaim { path: "h:/a".into(), claimant: "alice".into(), ttl_ms: 1 },
+    });
+
+    // After TTL, the claim is dead and Alice is dead → Bob acquires
+    let resp = apply(&db, Command {
+        request_id: None, now_ms: now + 2,
+        op: Op::Acquire(acquire_args("bob", 60_000, 2, vec![wr("h:/a")])),
+    });
+    assert!(matches!(resp, ApplyResponse::Acquire(AcquireOutcome::Ok)));
+}
+
+// ---------------------------------------------------------------------------
+// Multiple readers / reader lifecycle
+// ---------------------------------------------------------------------------
+
+#[test]
+fn multiple_readers_on_same_path() {
+    let (db, _dir) = open_temp_db();
+    let now = store_keys::now_ms();
+
+    // Alice reads
+    apply(&db, Command {
+        request_id: None, now_ms: now,
+        op: Op::Acquire(acquire_args("alice", 60_000, 0, vec![rd("h:/a")])),
+    });
+
+    // Bob reads same path → ok (shared read)
+    let resp = apply(&db, Command {
+        request_id: None, now_ms: now + 1,
+        op: Op::Acquire(acquire_args("bob", 60_000, 0, vec![rd("h:/a")])),
+    });
+    assert!(matches!(resp, ApplyResponse::Acquire(AcquireOutcome::Ok)));
+
+    // Carol reads same path → ok
+    let resp = apply(&db, Command {
+        request_id: None, now_ms: now + 2,
+        op: Op::Acquire(acquire_args("carol", 60_000, 0, vec![rd("h:/a")])),
+    });
+    assert!(matches!(resp, ApplyResponse::Acquire(AcquireOutcome::Ok)));
+
+    // All three appear in inspect
+    let mut txn = pathlockd::store_rocksdb::RocksDbTxn::new(db.clone(), now + 3);
+    let info = pathlockd::engine::inspect_path_inner(&mut txn, "h:/a").unwrap();
+    assert_eq!(info.read_owners.len(), 3);
+}
+
+#[test]
+fn release_one_reader_preserves_others() {
+    let (db, _dir) = open_temp_db();
+    let now = store_keys::now_ms();
+
+    apply(&db, Command {
+        request_id: None, now_ms: now,
+        op: Op::Acquire(acquire_args("alice", 60_000, 0, vec![rd("h:/a")])),
+    });
+    apply(&db, Command {
+        request_id: None, now_ms: now + 1,
+        op: Op::Acquire(acquire_args("bob", 60_000, 0, vec![rd("h:/a")])),
+    });
+
+    // Alice releases her read
+    apply(&db, Command {
+        request_id: None, now_ms: now + 2,
+        op: Op::Release { owner: "alice".into(), reqs: vec![rel("h:/a", Mode::Read)], del_wait: false },
+    });
+
+    // Bob still holds his read → Carol cannot write
+    let resp = apply(&db, Command {
+        request_id: None, now_ms: now + 3,
+        op: Op::Acquire(acquire_args("carol", 30_000, 1, vec![wr("h:/a")])),
+    });
+    match resp {
+        ApplyResponse::Acquire(AcquireOutcome::Conflict { reason, .. }) => {
+            assert_eq!(reason, "read_locked");
+        }
+        other => panic!("expected read_locked, got {:?}", other),
+    }
+}
+
+// ---------------------------------------------------------------------------
+// Force release edge cases
+// ---------------------------------------------------------------------------
+
+#[test]
+fn force_release_unknown_owner_is_noop() {
+    let (db, _dir) = open_temp_db();
+    let now = store_keys::now_ms();
+
+    // Bob acquires a lock
+    apply(&db, Command {
+        request_id: None, now_ms: now,
+        op: Op::Acquire(acquire_args("bob", 60_000, 1, vec![wr("h:/a")])),
+    });
+
+    // Force release a non-existent owner → no effect, Bob still holds
+    apply(&db, Command {
+        request_id: None, now_ms: now + 1,
+        op: Op::ForceRelease { victim: "ghost".into() },
+    });
+
+    // Bob still holds
+    let mut txn = pathlockd::store_rocksdb::RocksDbTxn::new(db.clone(), now + 2);
+    let info = pathlockd::engine::inspect_path_inner(&mut txn, "h:/a").unwrap();
+    assert_eq!(info.write_owner.as_deref(), Some("bob"));
+}
+
+// Inline-release edge case: the engine cannot see committed state from
+// an in-flight batch, so releasing all locks without acquiring new ones
+// does not immediately clear the alive key (see
+// `combined_acquire_and_release_keeps_owner_alive`). The GC sweep or a
+// subsequent operation handles cleanup.
+
+
+#[test]
+fn renew_refreshes_all_held_locks() {
+    let (db, _dir) = open_temp_db();
+    let now = store_keys::now_ms();
+
+    // Alice acquires two locks with 5s TTL
+    let args = AcquireArgs {
+        owner_id: "alice".into(), ttl_ms: 5_000, fencing_token: 1,
+        requests: vec![wr("h:/a"), rd("h:/b")],
+        release_requests: vec![],
+    };
+    apply(&db, Command { request_id: None, now_ms: now, op: Op::Acquire(args) });
+
+    // After 4s, renew extends everything
+    apply(&db, Command {
+        request_id: None, now_ms: now + 4_000,
+        op: Op::Renew { owner: "alice".into(), ttl_ms: 30_000 },
+    });
+
+    // After 6s (would have expired without renew), Alice still holds
+    let args = AcquireArgs {
+        owner_id: "alice".into(), ttl_ms: 10_000, fencing_token: 2,
+        requests: vec![wr_held("h:/a"), rd_held("h:/b")],
+        release_requests: vec![],
+    };
+    let resp = apply(&db, Command { request_id: None, now_ms: now + 6_000, op: Op::Acquire(args) });
+    assert!(matches!(resp, ApplyResponse::Acquire(AcquireOutcome::Ok)));
+}
+
+// ---------------------------------------------------------------------------
+// Cycle detection with advisory edges (no metadata → skip is_blocking)
+// ---------------------------------------------------------------------------
+
+#[test]
+fn detect_cycle_with_no_metadata_skips_is_blocking() {
+    let (db, _dir) = open_temp_db();
+    let now = store_keys::now_ms();
+
+    // Make both alive (but without actual locks that would satisfy is_blocking)
+    apply(&db, Command {
+        request_id: None, now_ms: now,
+        op: Op::Acquire(acquire_args("a", 60_000, 1, vec![wr("h:/x")])),
+    });
+    apply(&db, Command {
+        request_id: None, now_ms: now,
+        op: Op::Acquire(acquire_args("b", 60_000, 2, vec![wr("h:/y")])),
+    });
+
+    // Advisory edges with no metadata (empty conflict_path/reason → metadata=None)
+    apply(&db, Command {
+        request_id: None, now_ms: now,
+        op: Op::SetWaitEdge {
+            owner: "a".into(),
+            edge: pathlockd::raft::command::WaitEdge { conflict_owner: "b".into(), metadata: None },
+            ttl_ms: 60_000,
+        },
+    });
+    apply(&db, Command {
+        request_id: None, now_ms: now,
+        op: Op::SetWaitEdge {
+            owner: "b".into(),
+            edge: pathlockd::raft::command::WaitEdge { conflict_owner: "a".into(), metadata: None },
+            ttl_ms: 60_000,
+        },
+    });
+
+    // Cycle found (even though is_blocking on these paths would fail —
+    // without metadata, the check is skipped)
+    let mut txn = pathlockd::store_rocksdb::RocksDbTxn::new(db.clone(), now + 1);
+    let outcome = pathlockd::engine::detect_cycle_inner(&mut txn, "a", 10).unwrap();
+    match outcome {
+        CycleOutcome::Cycle(chain) => {
+            assert_eq!(chain, vec!["a", "b"]);
+        }
+        other => panic!("expected Cycle, got {:?}", other),
+    }
+}
+
+// ---------------------------------------------------------------------------
+// Lock inspection / observability
+// ---------------------------------------------------------------------------
+
+#[test]
+fn inspect_path_returns_correct_state() {
+    let (db, _dir) = open_temp_db();
+    let now = store_keys::now_ms();
+
+    // Alice writes /a
+    apply(&db, Command {
+        request_id: None, now_ms: now,
+        op: Op::Acquire(acquire_args("alice", 60_000, 1, vec![wr("h:/a")])),
+    });
+
+    let mut txn = pathlockd::store_rocksdb::RocksDbTxn::new(db.clone(), now + 1);
+    let info = pathlockd::engine::inspect_path_inner(&mut txn, "h:/a").unwrap();
+    assert_eq!(info.write_owner.as_deref(), Some("alice"));
+    assert!(info.read_owners.is_empty());
+    assert!(info.fence.is_some());
+}
+
+#[test]
+fn list_owner_locks_returns_all_held() {
+    let (db, _dir) = open_temp_db();
+    let now = store_keys::now_ms();
+
+    let args = AcquireArgs {
+        owner_id: "alice".into(), ttl_ms: 60_000, fencing_token: 1,
+        requests: vec![wr("h:/a"), rd("h:/b")],
+        release_requests: vec![],
+    };
+    apply(&db, Command { request_id: None, now_ms: now, op: Op::Acquire(args) });
+
+    let mut txn = pathlockd::store_rocksdb::RocksDbTxn::new(db.clone(), now + 1);
+    let (_alive, locks) = pathlockd::engine::list_owner_locks_inner(&mut txn, "alice").unwrap();
+    assert_eq!(locks.len(), 2);
+    let paths: Vec<&str> = locks.iter().map(|l| l.path.as_str()).collect();
+    assert!(paths.contains(&"h:/a"));
+    assert!(paths.contains(&"h:/b"));
+}
+
+// ---------------------------------------------------------------------------
+// Empty operations
+// ---------------------------------------------------------------------------
+
+#[test]
+fn empty_acquire_request_returns_ok() {
+    let (db, _dir) = open_temp_db();
+    let now = store_keys::now_ms();
+
+    let args = AcquireArgs {
+        owner_id: "alice".into(), ttl_ms: 60_000, fencing_token: 1,
+        requests: vec![],
+        release_requests: vec![],
+    };
+    let resp = apply(&db, Command { request_id: None, now_ms: now, op: Op::Acquire(args) });
+    assert!(matches!(resp, ApplyResponse::Acquire(AcquireOutcome::Ok)));
+}
+
+#[test]
+fn empty_release_requests_are_noop() {
+    let (db, _dir) = open_temp_db();
+    let now = store_keys::now_ms();
+
+    // Alice locks /a
+    apply(&db, Command {
+        request_id: None, now_ms: now,
+        op: Op::Acquire(acquire_args("alice", 60_000, 1, vec![wr("h:/a")])),
+    });
+
+    // Release with empty reqs → noop
+    apply(&db, Command {
+        request_id: None, now_ms: now + 1,
+        op: Op::Release { owner: "alice".into(), reqs: vec![], del_wait: false },
+    });
+
+    // Alice still holds
+    let mut txn = pathlockd::store_rocksdb::RocksDbTxn::new(db.clone(), now + 2);
+    let info = pathlockd::engine::inspect_path_inner(&mut txn, "h:/a").unwrap();
+    assert_eq!(info.write_owner.as_deref(), Some("alice"));
 }
