@@ -8,14 +8,16 @@
 //! Example `pathlockd.toml`:
 //! ```toml
 //! listen           = "0.0.0.0:50051"
-//! pd_endpoints     = ["pd0:2379", "pd1:2379", "pd2:2379"]
-//! peers            = ["http://pathlockd-1:50051", "http://pathlockd-2:50051"]
-//! gc_interval_secs = 1
-//! gc_page          = 256
-//! mvcc_gc_interval_secs = 300
-//! mvcc_gc_safe_point_retention_secs = 600
-//! stale_lock_resolve_interval_secs = 10
-//! stale_lock_grace_secs = 60
+//! node_id          = "pathlockd-0"
+//! data_dir         = "/var/lib/pathlockd"
+//! public_addr      = "http://pathlockd-0.pathlockd:50051"
+//! raft_addr        = "http://pathlockd-0.pathlockd:50052"
+//! gossip_addr      = "0.0.0.0:7946"
+//! seed_nodes       = ["pathlockd-0.pathlockd:7946", "pathlockd-1.pathlockd:7946"]
+//! group_count      = 256
+//! replication_factor = 3
+//! group_gc_interval_secs = 1
+//! group_gc_batch   = 1024
 //! event_buffer     = 8192
 //! request_timeout_ms = 30000
 //! max_concurrent_requests_per_connection = 256
@@ -27,58 +29,61 @@ use std::path::PathBuf;
 use clap::Parser;
 use serde::Deserialize;
 
-const MAX_GC_PAGE: u32 = 65_536;
 const MAX_EVENT_BUFFER: usize = 1_000_000;
 
 #[derive(Debug, Clone)]
 pub struct Config {
     /// gRPC listen address.
     pub listen: String,
-    /// PD (placement driver) endpoints of the TiKV cluster.
-    pub pd_endpoints: Vec<String>,
-    /// Background GC sweep interval (0 disables active GC; lazy expiry still applies).
-    pub gc_interval_secs: u64,
-    /// Keys scanned per GC page.
-    pub gc_page: u32,
-    /// TiKV transactional MVCC GC interval (0 disables; use this when another
-    /// TiDB/GC coordinator already advances the cluster safepoint).
-    pub mvcc_gc_interval_secs: u64,
-    /// How far behind PD's current timestamp TiKV MVCC GC may advance.
-    pub mvcc_gc_safe_point_retention_secs: u64,
-    /// Interval for the stale-lock resolver, which rolls back transaction locks
-    /// orphaned by a crashed/abandoned commit before MVCC GC's much larger
-    /// retention window would (0 disables).
-    pub stale_lock_resolve_interval_secs: u64,
-    /// A lock older than this is treated as stranded and resolved. Must comfortably
-    /// exceed the longest legitimate transaction, so it is not set below the
-    /// request timeout.
-    pub stale_lock_grace_secs: u64,
-    /// Per-subscriber event queue depth. Each `Subscribe` stream gets its own
-    /// bounded queue of this size carrying only its owner's events; an overflow
-    /// drops (the client recheck is the backstop).
+    /// Stable node identifier.
+    pub node_id: String,
+    /// Data directory for RocksDB groups.
+    pub data_dir: PathBuf,
+    /// Public gRPC address for clients and peers.
+    pub public_addr: String,
+    /// Internal Raft transport address.
+    pub raft_addr: String,
+    /// SWIM gossip address.
+    pub gossip_addr: String,
+    /// Seed nodes for initial cluster bootstrap.
+    pub seed_nodes: Vec<String>,
+    /// Number of Raft groups.
+    pub group_count: u32,
+    /// Voters per Raft group (must be odd).
+    pub replication_factor: u32,
+    /// Per-group GC sweep interval (seconds; 0 disables).
+    pub group_gc_interval_secs: u64,
+    /// Keys processed per GcSweep command.
+    pub group_gc_batch: u32,
+    /// Per-subscriber event queue depth.
     pub event_buffer: usize,
-    /// Peer pathlockd endpoints for cross-instance event fan-out (optional,
-    /// static list). Usually empty in favour of `peer_discovery_dns`.
+    /// Peer pathlockd endpoints for cross-instance event fan-out (optional, static list).
     pub peers: Vec<String>,
-    /// A `host:port` DNS name that resolves to the addresses of every pathlockd
-    /// replica — in Kubernetes, the headless Service fronting the StatefulSet
-    /// (e.g. `pathlockd-headless:50051`). The daemon periodically resolves it and
-    /// forwards events to each resolved peer, so cross-instance fan-out tracks
-    /// replica membership as it scales. Empty disables dynamic discovery.
+    /// A `host:port` DNS name that resolves to every replica's gossip address.
     pub peer_discovery_dns: Option<String>,
-    /// This instance's own IP, used to exclude itself from the discovered peer
-    /// set (in Kubernetes, wire from the downward API `status.podIP`). When unset,
-    /// the instance may forward an event to itself — harmless (it is also
-    /// delivered locally) but a wasted RPC.
+    /// This instance's own IP, used to exclude itself from discovered peers.
     pub self_ip: Option<String>,
-    /// How often to re-resolve `peer_discovery_dns` (seconds). Ignored when
-    /// discovery is disabled.
+    /// How often to re-resolve peer_discovery_dns (seconds).
     pub peer_refresh_secs: u64,
-    /// Server-side deadline applied to each unary/stream setup RPC.
+    /// Server-side deadline for each unary/stream setup RPC.
     pub request_timeout_ms: u64,
     /// Per-HTTP/2-connection request concurrency limit.
     pub max_concurrent_requests_per_connection: usize,
-    /// tracing-subscriber log filter (e.g. "info", "pathlockd=debug").
+    /// Bootstrap a new cluster.
+    pub bootstrap: bool,
+    /// Join an existing cluster.
+    pub join: bool,
+    /// Raft snapshot interval (entries).
+    pub raft_snapshot_interval_entries: u64,
+    /// Raft minimum log entries before snapshot.
+    pub raft_snapshot_min_log_entries: u64,
+    /// Max in-flight Raft proposals.
+    pub raft_max_inflight: usize,
+    /// Sync RocksDB WAL on every write.
+    pub rocksdb_wal_sync: bool,
+    /// RocksDB max open files.
+    pub rocksdb_max_open_files: i32,
+    /// tracing-subscriber log filter.
     pub log_level: String,
 }
 
@@ -86,13 +91,16 @@ impl Default for Config {
     fn default() -> Self {
         Config {
             listen: "0.0.0.0:50051".to_string(),
-            pd_endpoints: vec!["127.0.0.1:2379".to_string()],
-            gc_interval_secs: 1,
-            gc_page: 1024,
-            mvcc_gc_interval_secs: 300,
-            mvcc_gc_safe_point_retention_secs: 600,
-            stale_lock_resolve_interval_secs: 10,
-            stale_lock_grace_secs: 60,
+            node_id: "pathlockd-0".to_string(),
+            data_dir: PathBuf::from("/var/lib/pathlockd"),
+            public_addr: "http://localhost:50051".to_string(),
+            raft_addr: "http://localhost:50052".to_string(),
+            gossip_addr: "0.0.0.0:7946".to_string(),
+            seed_nodes: Vec::new(),
+            group_count: 256,
+            replication_factor: 3,
+            group_gc_interval_secs: 1,
+            group_gc_batch: 1024,
             event_buffer: 8192,
             peers: Vec::new(),
             peer_discovery_dns: None,
@@ -100,6 +108,13 @@ impl Default for Config {
             peer_refresh_secs: 10,
             request_timeout_ms: 30_000,
             max_concurrent_requests_per_connection: 256,
+            bootstrap: false,
+            join: false,
+            raft_snapshot_interval_entries: 10_000,
+            raft_snapshot_min_log_entries: 5_000,
+            raft_max_inflight: 256,
+            rocksdb_wal_sync: true,
+            rocksdb_max_open_files: 4096,
             log_level: "info".to_string(),
         }
     }
@@ -109,13 +124,16 @@ impl Default for Config {
 #[serde(deny_unknown_fields)]
 struct FileConfig {
     listen: Option<String>,
-    pd_endpoints: Option<Vec<String>>,
-    gc_interval_secs: Option<u64>,
-    gc_page: Option<u32>,
-    mvcc_gc_interval_secs: Option<u64>,
-    mvcc_gc_safe_point_retention_secs: Option<u64>,
-    stale_lock_resolve_interval_secs: Option<u64>,
-    stale_lock_grace_secs: Option<u64>,
+    node_id: Option<String>,
+    data_dir: Option<PathBuf>,
+    public_addr: Option<String>,
+    raft_addr: Option<String>,
+    gossip_addr: Option<String>,
+    seed_nodes: Option<Vec<String>>,
+    group_count: Option<u32>,
+    replication_factor: Option<u32>,
+    group_gc_interval_secs: Option<u64>,
+    group_gc_batch: Option<u32>,
     event_buffer: Option<usize>,
     peers: Option<Vec<String>>,
     peer_discovery_dns: Option<String>,
@@ -123,6 +141,13 @@ struct FileConfig {
     peer_refresh_secs: Option<u64>,
     request_timeout_ms: Option<u64>,
     max_concurrent_requests_per_connection: Option<usize>,
+    bootstrap: Option<bool>,
+    join: Option<bool>,
+    raft_snapshot_interval_entries: Option<u64>,
+    raft_snapshot_min_log_entries: Option<u64>,
+    raft_max_inflight: Option<usize>,
+    rocksdb_wal_sync: Option<bool>,
+    rocksdb_max_open_files: Option<i32>,
     log_level: Option<String>,
 }
 
@@ -130,27 +155,21 @@ struct FileConfig {
 #[command(
     name = "pathlockd",
     version,
-    about = "Hierarchical path-locking daemon over TiKV"
+    about = "Hierarchical path-locking daemon with embedded Multi-Raft and RocksDB"
 )]
 struct Cli {
-    /// Path to a TOML config file.
     #[arg(long, env = "PATHLOCKD_CONFIG")]
     config: Option<PathBuf>,
-    /// Probe a locally-running instance's Health RPC and exit 0 (ready) or 1.
-    /// Used by the container HEALTHCHECK; not for normal startup.
     #[arg(long, hide = true)]
     health_check: bool,
 }
 
 impl Config {
-    /// Parse CLI + config, returning the resolved config and whether this
-    /// invocation is a one-shot `--health-check` probe rather than the daemon.
     pub fn load() -> anyhow::Result<(Config, bool)> {
         let cli = Cli::parse();
         Ok((Config::load_from(cli.config)?, cli.health_check))
     }
 
-    /// Resolve config from an optional file path plus the environment.
     pub fn load_from(config_path: Option<PathBuf>) -> anyhow::Result<Config> {
         let mut cfg = Config::default();
 
@@ -159,173 +178,114 @@ impl Config {
                 .map_err(|e| anyhow::anyhow!("reading config {}: {e}", path.display()))?;
             let file: FileConfig = toml::from_str(&raw)
                 .map_err(|e| anyhow::anyhow!("parsing config {}: {e}", path.display()))?;
-            if let Some(v) = file.listen {
-                cfg.listen = v;
-            }
-            if let Some(v) = file.pd_endpoints {
-                cfg.pd_endpoints = v;
-            }
-            if let Some(v) = file.gc_interval_secs {
-                cfg.gc_interval_secs = v;
-            }
-            if let Some(v) = file.gc_page {
-                cfg.gc_page = v;
-            }
-            if let Some(v) = file.mvcc_gc_interval_secs {
-                cfg.mvcc_gc_interval_secs = v;
-            }
-            if let Some(v) = file.mvcc_gc_safe_point_retention_secs {
-                cfg.mvcc_gc_safe_point_retention_secs = v;
-            }
-            if let Some(v) = file.stale_lock_resolve_interval_secs {
-                cfg.stale_lock_resolve_interval_secs = v;
-            }
-            if let Some(v) = file.stale_lock_grace_secs {
-                cfg.stale_lock_grace_secs = v;
-            }
-            if let Some(v) = file.event_buffer {
-                cfg.event_buffer = v;
-            }
-            if let Some(v) = file.peers {
-                cfg.peers = v;
-            }
-            if let Some(v) = file.peer_discovery_dns {
-                cfg.peer_discovery_dns = Some(v);
-            }
-            if let Some(v) = file.self_ip {
-                cfg.self_ip = Some(v);
-            }
-            if let Some(v) = file.peer_refresh_secs {
-                cfg.peer_refresh_secs = v;
-            }
-            if let Some(v) = file.request_timeout_ms {
-                cfg.request_timeout_ms = v;
-            }
-            if let Some(v) = file.max_concurrent_requests_per_connection {
-                cfg.max_concurrent_requests_per_connection = v;
-            }
-            if let Some(v) = file.log_level {
-                cfg.log_level = v;
-            }
+            apply_file(&mut cfg, file);
         }
 
-        // Environment overrides (highest precedence).
-        if let Some(v) = env_string("PATHLOCKD_LISTEN") {
-            cfg.listen = v;
-        }
-        if let Some(v) = env_list("PATHLOCKD_PD_ENDPOINTS") {
-            cfg.pd_endpoints = v;
-        }
-        if let Some(v) = env_parse::<u64>("PATHLOCKD_GC_INTERVAL_SECS")? {
-            cfg.gc_interval_secs = v;
-        }
-        if let Some(v) = env_parse::<u32>("PATHLOCKD_GC_PAGE")? {
-            cfg.gc_page = v;
-        }
-        if let Some(v) = env_parse::<u64>("PATHLOCKD_MVCC_GC_INTERVAL_SECS")? {
-            cfg.mvcc_gc_interval_secs = v;
-        }
-        if let Some(v) = env_parse::<u64>("PATHLOCKD_MVCC_GC_SAFE_POINT_RETENTION_SECS")? {
-            cfg.mvcc_gc_safe_point_retention_secs = v;
-        }
-        if let Some(v) = env_parse::<u64>("PATHLOCKD_STALE_LOCK_RESOLVE_INTERVAL_SECS")? {
-            cfg.stale_lock_resolve_interval_secs = v;
-        }
-        if let Some(v) = env_parse::<u64>("PATHLOCKD_STALE_LOCK_GRACE_SECS")? {
-            cfg.stale_lock_grace_secs = v;
-        }
-        if let Some(v) = env_parse::<usize>("PATHLOCKD_EVENT_BUFFER")? {
-            cfg.event_buffer = v;
-        }
-        if let Some(v) = env_list("PATHLOCKD_PEERS") {
-            cfg.peers = v;
-        }
-        if let Some(v) = env_string("PATHLOCKD_PEER_DISCOVERY_DNS") {
-            cfg.peer_discovery_dns = Some(v);
-        }
-        if let Some(v) = env_string("PATHLOCKD_SELF_IP") {
-            cfg.self_ip = Some(v);
-        }
-        if let Some(v) = env_parse::<u64>("PATHLOCKD_PEER_REFRESH_SECS")? {
-            cfg.peer_refresh_secs = v;
-        }
-        if let Some(v) = env_parse::<u64>("PATHLOCKD_REQUEST_TIMEOUT_MS")? {
-            cfg.request_timeout_ms = v;
-        }
-        if let Some(v) = env_parse::<usize>("PATHLOCKD_MAX_CONCURRENT_REQUESTS_PER_CONNECTION")? {
-            cfg.max_concurrent_requests_per_connection = v;
-        }
-        if let Some(v) = env_string("PATHLOCKD_LOG_LEVEL") {
-            cfg.log_level = v;
-        }
+        apply_env(&mut cfg)?;
+        cfg.validate()?;
+        Ok(cfg)
+    }
 
-        if cfg.pd_endpoints.is_empty() {
-            anyhow::bail!("pd_endpoints must not be empty");
-        }
-        if cfg.request_timeout_ms == 0 {
+    fn validate(&self) -> anyhow::Result<()> {
+        if self.request_timeout_ms == 0 {
             anyhow::bail!("request_timeout_ms must be > 0");
         }
-        if cfg.max_concurrent_requests_per_connection == 0 {
+        if self.max_concurrent_requests_per_connection == 0 {
             anyhow::bail!("max_concurrent_requests_per_connection must be > 0");
         }
-        if cfg.event_buffer == 0 {
-            anyhow::bail!("event_buffer must be > 0");
+        if self.event_buffer == 0 || self.event_buffer > MAX_EVENT_BUFFER {
+            anyhow::bail!("event_buffer must be > 0 and <= {MAX_EVENT_BUFFER}");
         }
-        if cfg.event_buffer > MAX_EVENT_BUFFER {
-            anyhow::bail!("event_buffer too large (max {MAX_EVENT_BUFFER})");
+        if self.replication_factor % 2 == 0 {
+            anyhow::bail!("replication_factor must be odd");
         }
-        // A 0 page would make every GC scan return nothing and silently disable
-        // active reclamation. Disabling it is a job for gc_interval_secs = 0
-        // (which keeps lazy expiry); fail fast on the footgun instead.
-        if cfg.gc_interval_secs > 0 && cfg.gc_page == 0 {
-            anyhow::bail!("gc_page must be > 0 when gc is enabled (gc_interval_secs > 0)");
+        if self.group_count == 0 {
+            anyhow::bail!("group_count must be > 0");
         }
-        if cfg.gc_page > MAX_GC_PAGE {
-            anyhow::bail!("gc_page too large (max {MAX_GC_PAGE})");
+        if self.node_id.is_empty() {
+            anyhow::bail!("node_id must not be empty");
         }
-        if cfg.mvcc_gc_interval_secs > 0 {
-            if cfg.mvcc_gc_safe_point_retention_secs == 0 {
-                anyhow::bail!(
-                    "mvcc_gc_safe_point_retention_secs must be > 0 when mvcc gc is enabled"
-                );
-            }
-            let retention_ms = cfg.mvcc_gc_safe_point_retention_secs.saturating_mul(1000);
-            if retention_ms < cfg.request_timeout_ms.saturating_mul(2) {
-                anyhow::bail!(
-                    "mvcc_gc_safe_point_retention_secs must be at least 2x request_timeout_ms"
-                );
-            }
+        if self.join && self.seed_nodes.is_empty() {
+            anyhow::bail!("seed_nodes must not be empty for join mode");
         }
-        if cfg.stale_lock_resolve_interval_secs > 0 {
-            // Resolving a lock younger than the request timeout could roll back a
-            // legitimately in-flight transaction, so the grace window must clear
-            // it with margin.
-            let grace_ms = cfg.stale_lock_grace_secs.saturating_mul(1000);
-            if grace_ms < cfg.request_timeout_ms {
-                anyhow::bail!(
-                    "stale_lock_grace_secs must be at least request_timeout_ms (={} ms) when the stale-lock resolver is enabled",
-                    cfg.request_timeout_ms
-                );
-            }
+        if self.bootstrap && self.join {
+            anyhow::bail!("bootstrap and join are mutually exclusive");
         }
-        if let Some(dns) = &cfg.peer_discovery_dns {
-            // Must be `host:port` so it resolves to addressable replica endpoints;
-            // a bare host (no port) cannot be turned into a gRPC endpoint.
+        if let Some(dns) = &self.peer_discovery_dns {
             if !is_host_port(dns) {
-                anyhow::bail!(
-                    "peer_discovery_dns must be \"host:port\" (e.g. pathlockd-headless:50051): {dns}"
-                );
+                anyhow::bail!("peer_discovery_dns must be \"host:port\": {dns}");
             }
-            if cfg.peer_refresh_secs == 0 {
+            if self.peer_refresh_secs == 0 {
                 anyhow::bail!("peer_refresh_secs must be > 0 when peer_discovery_dns is set");
             }
         }
-        Ok(cfg)
+        Ok(())
     }
 }
 
-/// Whether `s` is a `host:port` pair with a non-empty host and a port in
-/// `1..=65535`. The host is a DNS name (no colons), so the last `:` splits it.
+fn apply_file(cfg: &mut Config, file: FileConfig) {
+    macro_rules! apply {
+        ($field:ident) => {
+            if let Some(v) = file.$field {
+                cfg.$field = v;
+            }
+        };
+    }
+    apply!(listen);
+    apply!(node_id);
+    apply!(data_dir);
+    apply!(public_addr);
+    apply!(raft_addr);
+    apply!(gossip_addr);
+    apply!(seed_nodes);
+    apply!(group_count);
+    apply!(replication_factor);
+    apply!(group_gc_interval_secs);
+    apply!(group_gc_batch);
+    apply!(event_buffer);
+    apply!(peers);
+    if let Some(v) = file.peer_discovery_dns {
+        cfg.peer_discovery_dns = Some(v);
+    }
+    if let Some(v) = file.self_ip {
+        cfg.self_ip = Some(v);
+    }
+    apply!(peer_refresh_secs);
+    apply!(request_timeout_ms);
+    apply!(max_concurrent_requests_per_connection);
+    apply!(bootstrap);
+    apply!(join);
+    apply!(raft_snapshot_interval_entries);
+    apply!(raft_snapshot_min_log_entries);
+    apply!(raft_max_inflight);
+    apply!(rocksdb_wal_sync);
+    apply!(rocksdb_max_open_files);
+    apply!(log_level);
+}
+
+fn apply_env(cfg: &mut Config) -> anyhow::Result<()> {
+    if let Some(v) = env_string("PATHLOCKD_LISTEN") { cfg.listen = v; }
+    if let Some(v) = env_string("PATHLOCKD_NODE_ID") { cfg.node_id = v; }
+    if let Some(v) = env_string("PATHLOCKD_DATA_DIR") { cfg.data_dir = PathBuf::from(v); }
+    if let Some(v) = env_string("PATHLOCKD_PUBLIC_ADDR") { cfg.public_addr = v; }
+    if let Some(v) = env_string("PATHLOCKD_RAFT_ADDR") { cfg.raft_addr = v; }
+    if let Some(v) = env_string("PATHLOCKD_GOSSIP_ADDR") { cfg.gossip_addr = v; }
+    if let Some(v) = env_list("PATHLOCKD_SEED_NODES") { cfg.seed_nodes = v; }
+    if let Some(v) = env_parse::<u32>("PATHLOCKD_GROUP_COUNT")? { cfg.group_count = v; }
+    if let Some(v) = env_parse::<u32>("PATHLOCKD_REPLICATION_FACTOR")? { cfg.replication_factor = v; }
+    if let Some(v) = env_parse::<u64>("PATHLOCKD_GROUP_GC_INTERVAL_SECS")? { cfg.group_gc_interval_secs = v; }
+    if let Some(v) = env_parse::<u32>("PATHLOCKD_GROUP_GC_BATCH")? { cfg.group_gc_batch = v; }
+    if let Some(v) = env_parse::<usize>("PATHLOCKD_EVENT_BUFFER")? { cfg.event_buffer = v; }
+    if let Some(v) = env_list("PATHLOCKD_PEERS") { cfg.peers = v; }
+    if let Some(v) = env_string("PATHLOCKD_PEER_DISCOVERY_DNS") { cfg.peer_discovery_dns = Some(v); }
+    if let Some(v) = env_string("PATHLOCKD_SELF_IP") { cfg.self_ip = Some(v); }
+    if let Some(v) = env_parse::<u64>("PATHLOCKD_PEER_REFRESH_SECS")? { cfg.peer_refresh_secs = v; }
+    if let Some(v) = env_parse::<u64>("PATHLOCKD_REQUEST_TIMEOUT_MS")? { cfg.request_timeout_ms = v; }
+    if let Some(v) = env_parse::<usize>("PATHLOCKD_MAX_CONCURRENT_REQUESTS_PER_CONNECTION")? { cfg.max_concurrent_requests_per_connection = v; }
+    if let Some(v) = env_string("PATHLOCKD_LOG_LEVEL") { cfg.log_level = v; }
+    Ok(())
+}
+
 fn is_host_port(s: &str) -> bool {
     s.rsplit_once(':')
         .is_some_and(|(host, port)| !host.is_empty() && port.parse::<u16>().is_ok_and(|p| p > 0))
@@ -370,10 +330,10 @@ mod tests {
 
     #[test]
     fn is_host_port_rejects_bad_forms() {
-        assert!(!is_host_port("pathlockd-headless")); // no port
-        assert!(!is_host_port(":50051")); // empty host
-        assert!(!is_host_port("host:0")); // zero port
-        assert!(!is_host_port("host:70000")); // out of u16 range
-        assert!(!is_host_port("host:grpc")); // non-numeric port
+        assert!(!is_host_port("pathlockd-headless"));
+        assert!(!is_host_port(":50051"));
+        assert!(!is_host_port("host:0"));
+        assert!(!is_host_port("host:70000"));
+        assert!(!is_host_port("host:grpc"));
     }
 }
