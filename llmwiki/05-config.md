@@ -6,23 +6,43 @@ Resolution order, lowest to highest precedence:
 2. a TOML file (`--config <path>` or `PATHLOCKD_CONFIG`)
 3. `PATHLOCKD_*` environment variables (env wins)
 
-| Field | TOML key | Env var | Default | Notes |
+## Config fields
+
+| Field | TOML key | Env var | Default | Description |
 |---|---|---|---|---|
-| listen addr | `listen` | `PATHLOCKD_LISTEN` | `0.0.0.0:50051` | gRPC bind address |
-| PD endpoints | `pd_endpoints` | `PATHLOCKD_PD_ENDPOINTS` | `127.0.0.1:2379` | TiKV PD; comma-separated in env |
-| peers | `peers` | `PATHLOCKD_PEERS` | `[]` | sibling replica endpoints for event fan-out |
-| GC interval | `gc_interval_secs` | `PATHLOCKD_GC_INTERVAL_SECS` | `1` | 0 disables active sweep (lazy expiry still applies) |
-| GC page | `gc_page` | `PATHLOCKD_GC_PAGE` | `1024` | keys scanned per GC page |
-| TiKV MVCC GC interval | `mvcc_gc_interval_secs` | `PATHLOCKD_MVCC_GC_INTERVAL_SECS` | `300` | 0 disables pathlockd-driven TiKV safepoint GC |
-| TiKV MVCC retention | `mvcc_gc_safe_point_retention_secs` | `PATHLOCKD_MVCC_GC_SAFE_POINT_RETENTION_SECS` | `600` | safepoint lag; must be at least 2x request timeout |
-| event buffer | `event_buffer` | `PATHLOCKD_EVENT_BUFFER` | `8192` | in-process broadcast capacity |
-| log level | `log_level` | `PATHLOCKD_LOG_LEVEL` | `info` | tracing filter |
+| gRPC listen | `listen` | `PATHLOCKD_LISTEN` | `0.0.0.0:50051` | gRPC bind address |
+| Node ID | `node_id` | `PATHLOCKD_NODE_ID` | `pathlockd-0` | Stable node identifier |
+| Data directory | `data_dir` | `PATHLOCKD_DATA_DIR` | `/var/lib/pathlockd` | RocksDB data directory |
+| Public address | `public_addr` | `PATHLOCKD_PUBLIC_ADDR` | `http://localhost:50051` | Public gRPC address for clients/peers |
+| Raft address | `raft_addr` | `PATHLOCKD_RAFT_ADDR` | `http://localhost:50052` | Internal Raft transport |
+| Gossip address | `gossip_addr` | `PATHLOCKD_GOSSIP_ADDR` | `0.0.0.0:7946` | SWIM gossip bind |
+| Seed nodes | `seed_nodes` | `PATHLOCKD_SEED_NODES` | `[]` | Gossip seed addresses (comma-separated in env) |
+| Group count | `group_count` | `PATHLOCKD_GROUP_COUNT` | `256` | Number of Raft groups |
+| Replication factor | `replication_factor` | `PATHLOCKD_REPLICATION_FACTOR` | `3` | Voters per group (must be odd) |
+| GC interval | `group_gc_interval_secs` | `PATHLOCKD_GROUP_GC_INTERVAL_SECS` | `1` | GC sweep interval (0 = off) |
+| GC batch | `group_gc_batch` | `PATHLOCKD_GROUP_GC_BATCH` | `1024` | Keys processed per GC sweep |
+| Event buffer | `event_buffer` | `PATHLOCKD_EVENT_BUFFER` | `8192` | Per-subscriber event queue depth |
+| Peers | `peers` | `PATHLOCKD_PEERS` | `[]` | Static peer list for event fan-out |
+| Peer discovery DNS | `peer_discovery_dns` | `PATHLOCKD_PEER_DISCOVERY_DNS` | none | Headless Service DNS for dynamic peer discovery |
+| Self IP | `self_ip` | `PATHLOCKD_SELF_IP` | none | Exclude own IP from discovered peers |
+| Peer refresh | `peer_refresh_secs` | `PATHLOCKD_PEER_REFRESH_SECS` | `10` | How often to re-resolve peer_discovery_dns |
+| Request timeout | `request_timeout_ms` | `PATHLOCKD_REQUEST_TIMEOUT_MS` | `30000` | Server-side RPC deadline (ms) |
+| Max concurrent | `max_concurrent_requests_per_connection` | `PATHLOCKD_MAX_CONCURRENT_REQUESTS_PER_CONNECTION` | `256` | Per-HTTP/2-connection request limit |
+| Bootstrap | `bootstrap` | `PATHLOCKD_BOOTSTRAP` | `false` | Bootstrap a new cluster |
+| Join | `join` | `PATHLOCKD_JOIN` | `false` | Join an existing cluster |
+| Raft snapshot interval | `raft_snapshot_interval_entries` | `PATHLOCKD_RAFT_SNAPSHOT_INTERVAL_ENTRIES` | `10000` | Entries between snapshots |
+| Raft snapshot min log | `raft_snapshot_min_log_entries` | `PATHLOCKD_RAFT_SNAPSHOT_MIN_LOG_ENTRIES` | `5000` | Min entries to trigger snapshot |
+| Raft max inflight | `raft_max_inflight` | `PATHLOCKD_RAFT_MAX_INFLIGHT` | `256` | Max in-flight proposals |
+| RocksDB WAL sync | `rocksdb_wal_sync` | `PATHLOCKD_ROCKSDB_WAL_SYNC` | `true` | Fsync WAL on every write |
+| RocksDB max open files | `rocksdb_max_open_files` | `PATHLOCKD_ROCKSDB_MAX_OPEN_FILES` | `4096` | File descriptor limit |
+| Log level | `log_level` | `PATHLOCKD_LOG_LEVEL` | `info` | tracing filter |
 
 Env lists are comma-separated. `RUST_LOG`, if set, overrides `log_level`
 (standard `tracing-subscriber` env filter).
 
-OpenTelemetry has no TOML fields. `src/otel.rs` enables OTLP traces and metrics
-from standard env vars:
+## OpenTelemetry
+
+`src/otel.rs` enables OTLP traces and metrics from standard env vars:
 
 - generic target: `OTEL_EXPORTER_OTLP_ENDPOINT`
 - signal-specific targets: `OTEL_EXPORTER_OTLP_TRACES_ENDPOINT`,
@@ -37,11 +57,8 @@ export stays off and normal tracing logs still initialize.
 
 ## Operational notes
 
-- **Clocks:** lease expiry uses PD's timestamp oracle so replicas share one time
-  source.
-- **GC at 1s** reclaims expired keys promptly. On a very large keyspace the
-  periodic full-range sweep can get expensive — raise the interval; correctness
-  does not depend on it (lazy expiry handles that).
-- **TiKV MVCC GC** is separate from logical expiry. Keep
-  `mvcc_gc_interval_secs` enabled for standalone TiKV; disable it if another
-  TiDB/GC coordinator owns the cluster safepoint.
+- **GC at 1s** reclaims expired keys promptly. Raise the interval for large
+  keyspaces; correctness does not depend on it (lazy expiry handles that).
+- **WAL fsync** (`rocksdb_wal_sync = true` by default) ensures every committed
+  apply is durable before the RPC returns. Disable only for throughput testing
+  where occasional node loss is acceptable.

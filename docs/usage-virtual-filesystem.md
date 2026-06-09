@@ -425,7 +425,7 @@ stop RENEW; stop SUBSCRIBE
 | `ForceRelease` | Preempt an owner (drops its locks, sends it `KILLED`). |
 | `IsOwnerAlive` | Is an owner's lease still live? |
 | `Subscribe` | Stream `REVOKE`/`KILLED`/`RELEASED` for one owner. |
-| `Health` | Readiness (also verifies TiKV reachability). |
+| `Health` | Readiness (verifies internal state-machine liveness). |
 
 For the exact message fields and enum values, see
 [`proto/pathlockd.proto`](../proto/pathlockd.proto).

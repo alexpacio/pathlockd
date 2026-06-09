@@ -15,7 +15,7 @@ REPO_ROOT="$(cd "$LIB_DIR/.." && pwd)"
 # build deps). Override either to pin or relocate.
 RUST_IMAGE="${PATHLOCKD_RUST_IMAGE:-rust:1-bookworm}"
 BUILDER_IMAGE="${PATHLOCKD_BUILDER_IMAGE:-pathlockd-builder:bookworm}"
-# Tiny image used only to probe PD's HTTP API while waiting for readiness.
+# Tiny image used only to probe readiness endpoints.
 PROBE_IMAGE="${PATHLOCKD_PROBE_IMAGE:-curlimages/curl:latest}"
 
 # Caches shared across unit/integration runs.
@@ -70,7 +70,7 @@ rust_run() {
     -e CARGO_TARGET_DIR=/target
     -w /src )
   [ -n "$net" ] && run+=( --network "$net" )
-  [ -n "${PATHLOCKD_PD_ENDPOINTS:-}" ] && run+=( -e "PATHLOCKD_PD_ENDPOINTS=$PATHLOCKD_PD_ENDPOINTS" )
+  # Tests run against the embedded RocksDB engine — no external services needed.
   if [ -n "${PATHLOCKD_EXTRA_ENV:-}" ]; then
     # PATHLOCKD_EXTRA_ENV is an opt-in list of docker-run flags assembled by
     # higher-level scripts for test-specific env forwarding, e.g.:

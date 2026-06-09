@@ -7,22 +7,28 @@ page you need.
 ## What pathlockd is
 
 A gRPC daemon offering hierarchical path-locking primitives, with all durable
-state in TiKV. One process = one stateless replica; correctness comes from TiKV
-transactions, not from process memory.
+state stored in an embedded Multi-Raft consensus engine backed by RocksDB. Each
+node holds its own copy of the data; correctness comes from the Raft log and the
+deterministic state machine.
 
 ## Source map
 
 | Path | Responsibility |
 |---|---|
 | `proto/pathlockd.proto` | The gRPC contract (the only public API). |
-| `src/store.rs` | TiKV key layout, value model, emulated TTL, transactions, GC. |
+| `src/store_rocksdb.rs` | RocksDB-backed `StoreTxn` trait, value model, TTL emulation. |
+| `src/store_keys.rs` | Key layout for all 14 column families. |
 | `src/engine.rs` | The lock primitives (acquire/release/renew/…), conflict logic. |
 | `src/service.rs` | gRPC service: proto ⇄ engine mapping, event publishing. |
 | `src/events.rs` | Per-owner event broadcaster + peer fan-out. |
 | `src/config.rs` | TOML + env configuration. |
-| `src/macros.rs` | `txn_retry!` — the transaction/retry wrapper. |
-| `src/main.rs` | Wiring, GC loop, graceful shutdown. |
-| `tests/engine_integration.rs` | Engine-level tests against a live TiKV. |
+| `src/raft/` | Multi-Raft state machine, commands, apply loop, snapshotting. |
+| `src/cluster/` | Gossip (SWIM/foca), sharding router, health checks. |
+| `src/main.rs` | Wiring, GC loop, peer discovery, graceful shutdown. |
+| `tests/engine_tests.rs` | Engine-level tests against in-process RocksDB. |
+| `tests/e2e_tests.rs` | E2E tests driving a spawned daemon over gRPC. |
+| `tests/chaos.rs` | Crash-recovery tests against RocksDB WAL. |
+| `tests/load.rs` | Load/performance tests against the in-process engine. |
 
 ## Pages
 
@@ -31,8 +37,7 @@ transactions, not from process memory.
 3. [The engine](03-engine.md) — every primitive, conflict precedence, fencing.
 4. [Events](04-events.md) — the per-owner stream, deadlock resolution, peers.
 5. [Configuration](05-config.md) — every knob.
-6. [Testing](06-testing.md) — running the suite against TiKV.
-7. [Extending](07-extending.md) — how to add a primitive or change behaviour.
+6. [Testing](06-testing.md) — running the suite.
 
 ## Invariants to preserve
 
@@ -45,5 +50,5 @@ transactions, not from process memory.
 - Every lock is a lease; nothing is held forever without renewal (`ttl_ms` must
   be `> 0`, so a lock can never be created non-expiring).
 - A subscription only ever sees its own owner's events.
-- Multi-key mutations are atomic and serialized **per handler** (parallel across
-  handlers; containment hazards never cross a handler).
+- Mutations are applied serially through a single RocksDB WriteBatch per group,
+  executed synchronously in the Raft state machine.

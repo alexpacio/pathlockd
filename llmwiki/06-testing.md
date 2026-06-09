@@ -7,81 +7,76 @@ volumes for fast reruns.
 
 | Script | What it does |
 | --- | --- |
-| `scripts/test-unit.sh` | `cargo test --lib --bins` in a container — the in-source `#[cfg(test)]` modules. No cluster needed. |
-| `scripts/test-integration.sh` | brings up PD + TiKV (via `infra.sh`) and runs the engine integration tests in a container joined to the dev network. |
-| `scripts/test-e2e-stress.sh` | brings up PD + TiKV, starts the daemon from the compiled test binary, drives gRPC load, and verifies GC drain. |
-| `scripts/infra.sh` | lifecycle for the local TiKV cluster: `up` / `wait` / `status` / `logs` / `down` / `reset`. |
-
+| `scripts/test-unit.sh` | `cargo test --lib --bins` in a container — the in-source `#[cfg(test)]` modules. |
+| `scripts/test-e2e-state.sh` | Runs the engine integration tests against in-process RocksDB. No external services needed. |
+| `scripts/test-e2e-safety.sh` | Spawns a daemon and runs e2e tests over gRPC. |
+| `scripts/test-e2e-stress.sh` | Runs chaos/resilience tests (WAL crash recovery, checkpoint consistency). |
 Test scripts forward extra args to the test (e.g. a name filter):
-`scripts/test-unit.sh handler_of`, `scripts/test-integration.sh fencing`,
-`scripts/test-e2e-stress.sh daemon_gc`.
+`scripts/test-unit.sh handler_of`, `scripts/test-e2e-state.sh fencing`,
+`scripts/test-e2e-stress.sh crash_recovery`.
 
 ## Unit tests (in-source `#[cfg(test)]`)
 
-Pure tests in `engine.rs` / `service.rs` / `store.rs` (path/ttl validation,
-ancestor walking, fence parsing, expiry math). They don't touch TiKV.
+Pure tests in `engine.rs` / `service.rs` / `store_rocksdb.rs` / `config.rs`
+(path/ttl validation, ancestor walking, fence parsing, expiry math,
+`StoreTxn` trait implementations). They don't touch external services.
 
 ```bash
 ./scripts/test-unit.sh
 ```
 
-## Engine integration tests (`tests/engine_integration.rs`)
+## Engine integration tests (`tests/engine_tests.rs`)
 
-Exercise the primitives against a **real** TiKV cluster: hierarchical conflict
-precedence, point-only reads, fencing (assert + stale owner + stale token),
-lock-loss on held/renew, dead-owner pruning, deadlock cycle detection,
-is-blocking, inline shadowing release, and release-all.
+Exercise the primitives directly against the in-process RocksDB state machine:
+hierarchical conflict precedence, point-only reads, fencing (assert + stale
+owner + stale token), lock-loss on held/renew, dead-owner pruning, deadlock
+cycle detection, is-blocking, inline shadowing release, release-all, and GC
+pruning.
 
-They flush the whole keyspace between tests and share one runtime + client, so
-run serially.
-
-### Run them
-
-A single-node TiKV (PD + TiKV) is enough. Under Docker Desktop the cleanest path
-is to run the tests *inside* the compose network (so the process resolves PD/
-TiKV by their compose-DNS names):
+Each test creates a fresh RocksDB in a temp directory with all 14 column
+families, builds `Command`s, runs `state_machine::apply()`, and asserts
+outcomes. No containers, no network, no external services.
 
 ```bash
-docker compose -f docker-compose.dev.yml up -d
-./scripts/test-in-docker.sh
+./scripts/test-e2e-state.sh
+cargo test --test engine_tests                    # run directly (host cargo)
 ```
 
-`scripts/test-in-docker.sh` runs `cargo test --test engine_integration --
---test-threads=1` in a throwaway `rust` container joined to the dev network,
-with the cargo registry/target cached in volumes for fast reruns.
+## E2E daemon tests (`tests/e2e_tests.rs`)
 
-On a native-Linux host you can instead publish PD/TiKV ports and run
-`PATHLOCKD_PD_ENDPOINTS=127.0.0.1:2379 cargo test --test engine_integration --
---test-threads=1` directly.
+Spawns a `pathlockd` binary as a child process in single-node mode and drives it
+over gRPC via `PathLockClient`. Tests acquire, release, renew, fencing token
+verification, deadlock detection, preemption claims, and GC drain — all through
+the public gRPC API.
 
-## Daemon e2e stress (`tests/e2e_stress.rs`)
+```bash
+./scripts/test-e2e-safety.sh
+cargo test --test e2e_tests                       # run directly (host cargo)
+```
 
-Starts multiple peered `pathlockd` replicas with debug enabled, logical GC at
-1s, TiKV MVCC GC at 1s, checks cross-replica release-event fan-out, then creates
-many short-lived read locks over gRPC. The test waits for the logical `fslock:`
-keyspace to drain without resetting TiKV volumes.
+## Chaos/resilience tests (`tests/chaos.rs`)
+
+Tests crash recovery from the RocksDB WAL: apply commands, kill the process,
+reopen the database, and verify committed state survived. Also covers
+crash-before-apply scenarios and checkpoint/restore consistency.
 
 ```bash
 ./scripts/test-e2e-stress.sh
-PATHLOCKD_E2E_STRESS_REPLICAS=3 ./scripts/test-e2e-stress.sh
-PATHLOCKD_E2E_STRESS_WORKERS=32 PATHLOCKD_E2E_STRESS_OPS_PER_WORKER=1000 \
-  ./scripts/test-e2e-stress.sh
-PATHLOCKD_E2E_STRESS_HANDLERS=1 ./scripts/test-e2e-stress.sh  # one hot handler
+cargo test --test chaos                           # run directly (host cargo)
+```
+
+## Load tests (`tests/load.rs`)
+
+Measures throughput and latency under different workload profiles against the
+in-process RocksDB engine.
+
+```bash
+cargo test --test load --release -- --nocapture   # run directly
 ```
 
 ## Manual smoke
 
 ```bash
-docker compose up --build            # full stack incl. the daemon
+docker compose up --build            # single instance
 grpcurl -plaintext localhost:50051 pathlockd.v1.PathLock/Health
 ```
-
-## Notes for changes
-
-- New behaviour → add an engine test asserting the outcome value (OK / CONFLICT
-  reason / LOST reason), not internal keys, so tests stay decoupled from the
-  byte layout.
-- Engine integration tests use internal `engine::inject_*` and
-  `engine::inspect_*` helpers for fault injection: expire an owner, drop a key,
-  plant a stale fence/owner, and read raw state. These helpers are not exposed
-  over gRPC.

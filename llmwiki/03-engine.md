@@ -1,10 +1,10 @@
 # The engine (`src/engine.rs`)
 
-Each public function is one atomic primitive. They take a `&TransactionClient`
-and run inside `txn_retry!`. Logical outcomes are returned as values. Multi-key
-mutations call `tx.serialize_handler(h)` for each handler they touch (per-handler
-serialization); `acquire` uses the `commit_if:` form so a CONFLICT/LOST outcome
-rolls back rather than committing or serializing.
+Each public function is one atomic primitive implemented as a synchronous,
+deterministic inner function generic over `StoreTxn`. The Raft state machine
+calls these during apply; the router builds commands and sends them to the
+correct group leader. All engine functions are sync because RocksDB operations
+are inherently sync.
 
 ## Path helpers
 
@@ -27,22 +27,21 @@ inline `release_requests`.
      self `wr` (`write_locked`), pruning dead write owners while doing so; for a
      *write* additionally: foreign reader on self (`read_locked`, after pruning
      dead readers), a foreign write in the subtree (`descendant_write_locked`),
-     a foreign read in the subtree
-     (`descendant_read_locked`), and a higher persisted fence
-     (`stale_fencing_token`). Reads are point-only — they do **not** scan
-     descendants.
+     a foreign read in the subtree (`descendant_read_locked`), and a higher
+     persisted fence (`stale_fencing_token`). Reads are point-only — they do
+     **not** scan descendants.
 3. **Execution.** Refresh `alive`; for each request add to `own:<owner>` and
-   write `wr`/`rd` + fence + descendant indexes. Re-acquiring an owned path
-   refreshes its TTL and advances the fence to the (validated ≥) token. Since the
-   call advances `alive` and the whole `own` set to `now+ttl`, it then refreshes
-   every *other* still-held path to the same horizon too, so the single owner
-   lease never outlives the keys backing it. If one of those unlisted held paths
-   has vanished, acquire reports `LOST` instead of masking the loss. A read-only
-   acquire can refresh an unlisted write by preserving its existing fence value;
-   a positive token advances it and still fails if stale. A call with no requests
-   and no releases is a no-op (it does not stamp an orphan `alive`).
+   write `wr`/`rd` + fence + descendant indexes via the `StoreTxn`. Re-acquiring
+   an owned path refreshes its TTL and advances the fence to the (validated ≥)
+   token. Since the call advances `alive` and the whole `own` set to `now+ttl`,
+   it then refreshes every *other* still-held path to the same horizon too, so
+   the single owner lease never outlives the keys backing it. If one of those
+   unlisted held paths has vanished, acquire reports `LOST` instead of masking
+   the loss. A read-only acquire can refresh an unlisted write by preserving its
+   existing fence value; a positive token advances it and still fails if stale.
+   A call with no requests and no releases is a no-op.
 4. **Inline release.** Any `release_requests` are applied in the same
-   transaction (used for shadowing transitions: acquire the covering ancestor
+   `WriteBatch` (used for shadowing transitions: acquire the covering ancestor
    and drop now-redundant child keys atomically).
 
 **Conflict precedence** (fixed): `ancestor_locked` → `write_locked` →
@@ -78,12 +77,12 @@ covering write lock at its token.
 ## `detect_cycle`
 
 Walk the wait-for graph from `start` following `wait:<owner>` edges up to
-`max_depth`. Returns `cycle(chain)` if it returns to `start`, `none` if the chain
-ends or revisits a node, `truncated(chain)` at the depth limit. Stale edges
-pointing at a dead owner are deleted during the walk (self-healing). Newer wait
-edges also carry the original `conflict_path` + `reason`; those are re-checked,
-and a live-but-no-longer-blocking edge is deleted before it can produce a false
-cycle.
+`max_depth`. Returns `cycle(chain)` if it returns to `start`, `none` if the
+chain ends or revisits a node, `truncated(chain)` at the depth limit. Stale
+edges pointing at a dead owner are deleted during the walk (self-healing). Newer
+wait edges also carry the original `conflict_path` + `reason`; those are
+re-checked, and a live-but-no-longer-blocking edge is deleted before it can
+produce a false cycle.
 
 ## `is_blocking`
 
@@ -93,12 +92,14 @@ the predicate a waiter polls to decide when to retry an acquire.
 
 ## Single-key helpers
 
-`incr_fencing_token` (monotonic counter), `set_wait_edge` / `clear_wait_edge`
-(the wait-for graph), `is_owner_alive` (liveness probe). These skip the
-serialization key.
+`incr_fencing_token` (monotonic counter in `CF_META`), `set_wait_edge` /
+`clear_wait_edge` (the wait-for graph in `CF_WAIT_EDGES`), `is_owner_alive`
+(liveness probe in `CF_OWNER_ALIVE`), `set_claim` (preemption reservation in
+`CF_CLAIMS`). These are simple single-column-family operations.
 
-## Test-support ops
+## Concurrency
 
-`inject_*` and `inspect_*` functions are internal helpers for fault-injection
-tests: expire an owner, drop a lock key, plant a raw write owner / fence, read
-raw state. They are not exposed over gRPC.
+Engine functions are deterministic and synchronous. The Raft state machine calls
+them inside a single `WriteBatch` commit. The serialized apply per group
+guarantees read-modify-write atomicity without optimistic retry loops or
+per-handler serialization keys.

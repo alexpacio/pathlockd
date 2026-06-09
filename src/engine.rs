@@ -285,7 +285,7 @@ fn find_descendant_write_conflict<T: StoreTxn>(
     let idx = wrdesc_key(path);
     let candidates = tx.smembers_limited(WRDESC_CF, &idx, MAX_SET_ENUM_MEMBERS)?;
     if candidates.len() > SCAN_WARN_THRESHOLD {
-        warn!(key = ?path, count = candidates.len(), "fslock: large wrdesc scan");
+        warn!(key = ?path, count = candidates.len(), "large wrdesc scan");
     }
     for candidate in candidates {
         match get_live_write_owner(tx, &candidate)? {
@@ -337,7 +337,7 @@ fn find_descendant_claim_conflict<T: StoreTxn>(
     let idx = claimdesc_key(path);
     let candidates = tx.smembers_limited(CLAIMDESC_CF, &idx, MAX_SET_ENUM_MEMBERS)?;
     if candidates.len() > SCAN_WARN_THRESHOLD {
-        warn!(key = ?path, count = candidates.len(), "fslock: large claimdesc scan");
+        warn!(key = ?path, count = candidates.len(), "large claimdesc scan");
     }
     for candidate in candidates {
         match get_live_claim(tx, &candidate)? {

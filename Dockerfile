@@ -1,8 +1,7 @@
 # ---- builder ----
 FROM rust:1-trixie AS builder
 
-# grpcio (pulled in by tikv-client) builds the gRPC C-core via cmake; bindgen is
-# not required (checked-in bindings) but cmake/clang/pkg-config/openssl are.
+# rocksdb builds its C++ sources via cc-rs; cmake/clang/pkg-config are required.
 RUN apt-get update && apt-get install -y --no-install-recommends \
         protobuf-compiler cmake clang pkg-config libssl-dev \
     && rm -rf /var/lib/apt/lists/*
@@ -18,19 +17,24 @@ ARG RUSTFLAGS=""
 ENV RUSTFLAGS=${RUSTFLAGS}
 RUN cargo build --release --locked
 
+# ---- dirs (creates writable data dir owned by nonroot) ----
+FROM busybox AS dirs
+RUN mkdir -p /data/pathlockd && chown 65532:65532 /data/pathlockd
+
 # ---- runtime ----
 FROM gcr.io/distroless/cc-debian13 AS runtime
 
+COPY --from=dirs --chown=65532:65532 /data /data
 COPY --from=builder /build/target/release/pathlockd /usr/local/bin/pathlockd
 
 EXPOSE 50051
 ENV PATHLOCKD_LISTEN=0.0.0.0:50051
+ENV PATHLOCKD_DATA_DIR=/data/pathlockd
 
 # distroless/base ships a built-in nonroot user (uid 65532).
 USER nonroot
 
-# Liveness/readiness via the daemon's own Health RPC (also verifies TiKV
-# reachability). Uses the binary itself, so no extra tooling in the image.
+# Liveness/readiness via the daemon's own Health RPC (verifies internal readiness).
 HEALTHCHECK --interval=10s --timeout=3s --start-period=15s --retries=3 \
     CMD ["/usr/local/bin/pathlockd", "--health-check"]
 

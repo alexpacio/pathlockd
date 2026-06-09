@@ -1,98 +1,90 @@
-# Data model (`src/store.rs`)
+# Data model (`src/store_rocksdb.rs` + `src/store_keys.rs`)
 
-TiKV gives cross-key ACID transactions but no TTL, no set type, and no
-server-side scripting. Everything below is built on plain keys + values.
+RocksDB provides persistent key-value storage with column families. Per-key TTL,
+set operations, and atomic transactions are built on top via the `StoreTxn` trait
+and the serialized Raft state machine.
 
-## Keys
+## Column families
 
-All lock metadata lives under the `fslock:` prefix. A *path* is
-`"<handler>:<normalizedPath>"`, e.g. `google_drive:/a/b`.
+All lock metadata lives across 14 RocksDB column families:
 
-| Key | Holds | Meaning |
-|---|---|---|
-| `fslock:wr:<path>` | `Str` = owner id | a write lock on `<path>` |
-| `fslock:rd:<path>` | `Set` of owner ids | read locks on `<path>` |
-| `fslock:fence:<path>` | `Str` = token | highest fencing token seen for `<path>` |
-| `fslock:alive:<owner>` | `Str` = "1" | the owner's lease (liveness) |
-| `fslock:own:<owner>` | `Set` of `"mode:path"` | everything the owner holds |
-| `fslock:wait:<owner>` | `Str` = blocker owner plus optional conflict metadata | a wait-for edge for deadlock detection |
-| `fslock:idx:wrdesc:<anc>` | `Set` of descendant paths | write locks somewhere under `<anc>` |
-| `fslock:idx:rddesc:<anc>` | `Set` of descendant paths | read locks somewhere under `<anc>` |
-| `fslock:fencing:counter` | `Counter` | the monotonic fencing-token source |
-| `pathlockd:__serialize__:<handler>` | (tombstone only) | per-handler serialization key (never read as a value) |
-| `pathlockd:gc:<name>` | `Str` = replica id | short background-GC coordination lease |
+| CF constant | Purpose |
+|---|---|
+| `CF_WRITE_LOCKS` | Active write lock: path → owner |
+| `CF_READ_LOCKS` | Active read locks: path\0owner → presence (set) |
+| `CF_FENCES` | Write-lock fencing tokens: path → token (min 24h TTL) |
+| `CF_CLAIMS` | Preemption reservations: path → claimant |
+| `CF_DESC_WRITE` | Descendant write index: ancestor\0path (reverse index) |
+| `CF_DESC_READ` | Descendant read index: ancestor\0path |
+| `CF_DESC_CLAIM` | Descendant claim index: ancestor\0path |
+| `CF_OWNER_ALIVE` | Liveness marker: owner → "1" |
+| `CF_OWNER_HOLDS` | Owner's held locks set: owner\0mode\0path → member |
+| `CF_WAIT_EDGES` | Deadlock-graph edges: owner → encoded WaitEdge |
+| `CF_EXPIRY` | TTL index: expires_at\0cf\0primary_key (shadow records) |
+| `CF_META` | Global metadata: fence_counter (monotonic) |
+| `CF_RAFT_LOG` | Raft log entries (managed by openraft) |
+| `CF_DEFAULT` | Catch-all safety net |
 
-The descendant indexes (`idx:wrdesc` / `idx:rddesc`) are what make a write-lock's
-subtree conflict check O(subtree) instead of O(keyspace): a write at `/a` reads
-`idx:wrdesc:.../a` and `idx:rddesc:.../a` to find locks below it directly.
-
-## Values (`Stored`)
+## Values (`StoredRecord`)
 
 ```rust
-enum Stored {
-    Str { v: String, exp: u64 },          // wr / fence / alive / wait / set member
-    Counter { v: i64 },                   // fencing:counter (never expires)
+enum StoredRecord {
+    Str { v: String, exp: u64 },          // string + absolute expiry (epoch-ms)
+    Counter { v: i64 },                   // monotonic counter (never expires)
 }
 ```
 
-`exp` is an absolute expiry in epoch-ms; `exp == 0` means "no expiry". Values are
-bincode-encoded.
+Values are encoded with `bincode`. `exp == 0` means "no expiry".
 
-**Set members expire individually.** A set keeps an expiry *per member*, not one
-for the whole set. This is a correctness requirement: read sets and descendant
-indexes aggregate entries with independent lifetimes, and a single set-wide
-expiry (last-writer-wins) could let a short-lived member shorten the set below a
-longer-lived one — making a still-held lock invisible to a conflict scan and
-allowing two writers into overlapping subtrees. With per-member expiry an entry
-stays visible exactly as long as the lock it mirrors. Adds are also *extend-only*
-(`merge_exp`), so re-adding a member can never shorten it, and rewriting a set
-drops already-expired members to bound growth. (Changing this encoding is why a
-keyspace from an older build must be flushed before upgrading.)
+**Set members expire individually.** Set-valued columns (`CF_READ_LOCKS`,
+`CF_OWNER_HOLDS`, descendant indexes) use a member-key prefix pattern: set key
+`K`, member `M` is stored as `K\0M`. Each member carries its own TTL, so a
+short-lived member never shortens the set below a longer-lived one. Adds are
+extend-only — re-adding a member can never shorten it.
 
 ## Emulated TTL
 
-- **Write** stamps `exp = now + ttl` (fence keys use `max(ttl, 1 day)` so a stale
-  token outlives the lock).
-- **Lazy expiry (correctness):** a read of an entry with `now >= exp` returns
+- **Write** stamps `exp = now_ms + ttl` (fence keys use `max(ttl, 1 day)` so a
+  stale token outlives the lock).
+- **Lazy expiry (correctness):** a read of an entry with `now_ms >= exp` returns
   *absent*. This is what makes an expired lock disappear without any sweeper.
-- **Active expiry (housekeeping):** `gc_once` periodically scans the `fslock:`
-  range and deletes elapsed entries to reclaim space. Default interval: 1s. It is
+- **Active expiry (housekeeping):** the GC sweep task periodically scans the
+  `CF_EXPIRY` column family for shadow records whose `expires_at <= now_ms`,
+  verifies the shadowed data record is still expired, and deletes both.
+  Configurable via `group_gc_interval_secs` and `group_gc_batch`. It is
   best-effort and never required for correctness.
-- **TiKV MVCC GC (storage housekeeping):** `mvcc_gc_once` periodically advances
-  TiKV's transactional safepoint behind PD time. This reclaims old MVCC
-  versions/tombstones from transactions; it is separate from deleting expired
-  logical `fslock:` keys.
-- **Replica coordination:** logical and MVCC GC loops first acquire a short
-  `pathlockd:gc:*` lease, so scaled pathlockd replicas do not all sweep at once.
 
-## Atomicity & serialization
+## Atomicity
 
-Each primitive runs inside `Tx` (`store.rs`), an optimistic TiKV transaction
-created via `txn_retry!`:
+Mutations are applied synchronously through a single RocksDB `WriteBatch` in the
+Raft state machine's `apply()` function. The `StoreTxn` trait abstracts write
+operations — the state machine builds a batch, runs the engine function, and
+commits atomically. No optimistic retry loops or per-handler serialization keys
+are needed — the serialized apply lock guarantees the read-modify-write atomicity
+the engine assumes.
 
-- `Tx::begin(client)` opens the optimistic transaction. A multi-key mutation
-  then calls `tx.serialize_handler(h)` for every handler it touches, deleting
-  `serialize_key(h)` (`pathlockd:__serialize__:<handler>`). A delete still writes
-  an MVCC tombstone, so two transactions that share a handler both write that
-  key → optimistic write-write conflict at commit → the loser retries with a
-  fresh snapshot. Net effect: mutations are serial *per handler*, parallel
-  across handlers, without accumulating a live key for every handler ever seen.
-  Containment hazards never cross handlers, so this is sufficient.
-- Reads use the transaction snapshot; the serialization key + retry guarantee a
-  retrying transaction reads the latest committed state.
-- `Tx` exposes Redis-flavoured helpers — `get_str/set_str`, `sadd/srem/smembers/
-  scard/sismember`, `incr` — each implemented as a value read-modify-write.
+## The `StoreTxn` trait
 
-`txn_retry!` retries only on transient TiKV errors (write conflict, region
-churn, …), bounded by `MAX_RETRY` (with jittered backoff). Logical outcomes
-(OK / CONFLICT / LOST) are *values*, never errors, so they commit normally. The
-`commit_if:` form additionally rolls back instead of committing when the outcome
-performed no durable mutation (e.g. an acquire that returns CONFLICT/LOST from
-read-only validation), so failed attempts neither serialize nor write.
+```rust
+pub trait StoreTxn {
+    fn now_ms(&self) -> u64;
+    fn get_str(&mut self, cf: &'static str, key: &[u8]) -> Result<Option<String>>;
+    fn set_str(&mut self, cf: &'static str, key: &[u8], value: &str, ttl_ms: u64) -> Result<()>;
+    fn pexpire_str(&mut self, cf: &'static str, key: &[u8], ttl_ms: u64) -> Result<()>;
+    fn del(&mut self, cf: &'static str, key: &[u8]) -> Result<()>;
+    fn sadd(&mut self, cf: &'static str, key: &[u8], member: &str, ttl_ms: u64) -> Result<()>;
+    fn srem(&mut self, cf: &'static str, key: &[u8], member: &str) -> Result<()>;
+    fn smembers_limited(&mut self, cf: &'static str, key: &[u8], limit: usize) -> Result<Vec<String>>;
+    fn sismember(&mut self, cf: &'static str, key: &[u8], member: &str) -> Result<bool>;
+    fn has_live_member(&mut self, cf: &'static str, key: &[u8]) -> Result<bool>;
+    fn pexpire_set(&mut self, cf: &'static str, key: &[u8], ttl_ms: u64) -> Result<()>;
+    fn del_set(&mut self, cf: &'static str, key: &[u8]) -> Result<()>;
+}
+```
 
-## Transaction drop safety
-
-Transactions are opened with `CheckLevel::Warn`: an optimistic transaction
-dropped without commit/rollback (e.g. a cancelled future) only logs — it never
-crashes the daemon and has no durable effect (optimistic transactions buffer
-writes locally and take no locks until commit).
+Two implementations exist:
+- **Raft state machine WriteBatch wrapper** — for mutating operations.
+- **`RocksDbTxn`** — a read-only snapshot wrapper for observability reads
+  (`inspect_path`, `list_owner_locks`, `dump_locks`, `detect_cycle`,
+  `is_blocking`). Write methods bail; `del`/`srem`/`del_set` are silent no-ops
+  (lazy cleanup of already-expired entries is best-effort).
