@@ -4,7 +4,7 @@ package pathlockd.v1;
 
 // pathlockd — fast, scalable, opinionated path-based distributed locking
 // primitives for developers building user-space virtual filesystems, with lock
-// metadata persisted in TiKV.
+// metadata persisted in an embedded Multi-Raft + RocksDB engine.
 //
 // Each lock is owned by a caller-supplied owner id, leases a set of hierarchical
 // paths (read or write), renews its lease to stay alive, and observes lifecycle
