@@ -25,7 +25,7 @@
 #
 # Docker images are published automatically by the GitHub Actions workflow on
 # every v* tag push; use --docker only for local / manual image builds.
-# The docker image is built with RUSTFLAGS="-C target-cpu=x86-64-v3" by default.
+# The docker image is built with default compiler target settings.
 # Add --docker-force to rebuild and push even if the image tag already exists in GHCR.
 # Add --arm64 to also build and push the linux/arm64 target alongside linux/amd64
 # (skipped by default; requires the local builder to have arm64 emulation).
@@ -174,7 +174,7 @@ if [ "$DRY_RUN" = 1 ]; then
   [ "$BUILD" = 0 ]  && note "  no --build: release will be created without binary artifacts."
   if [ "$DOCKER" = 1 ]; then
     PLATFORMS="linux/amd64"; [ "$ARM64" = 1 ] && PLATFORMS="linux/amd64,linux/arm64"
-    note "  --docker:    would push $GHCR_IMAGE:$VERSION ($PLATFORMS, x86-64-v3 optimized) to GHCR."
+    note "  --docker:    would push $GHCR_IMAGE:$VERSION ($PLATFORMS) to GHCR."
     [ "$DOCKER_FORCE" = 1 ] && note "  --docker-force: will overwrite existing image tag."
   fi
   note "  The GitHub Actions workflow will publish the default container image automatically on tag push."
@@ -225,10 +225,9 @@ if [ "$DOCKER" = 1 ]; then
   if [ "$DOCKER_FORCE" = 0 ] && docker buildx imagetools inspect "$GHCR_IMAGE:$VERSION" >/dev/null 2>&1; then
     note "$GHCR_IMAGE:$VERSION already exists — skipping multi-platform push (use --docker-force to override)."
   else
-    note "pushing $GHCR_IMAGE:$VERSION ($DOCKER_PLATFORMS, x86-64-v3 optimized) …"
+    note "pushing $GHCR_IMAGE:$VERSION ($DOCKER_PLATFORMS) …"
     docker buildx build \
       --platform "$DOCKER_PLATFORMS" \
-      --build-arg RUSTFLAGS="-C target-cpu=x86-64-v3" \
       -t "$GHCR_IMAGE:$VERSION" \
       --push \
       .
