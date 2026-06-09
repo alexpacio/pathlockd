@@ -1548,3 +1548,259 @@ fn empty_release_requests_are_noop() {
     let info = pathlockd::engine::inspect_path_inner(&mut txn, "h:/a").unwrap();
     assert_eq!(info.write_owner.as_deref(), Some("alice"));
 }
+
+// ---------------------------------------------------------------------------
+// Regression tests: read-your-writes, discard-on-fail, GC cursor,
+// oversized-owner recovery, fence expiry-index dedupe
+// ---------------------------------------------------------------------------
+
+/// A write lock whose owner has no alive record (legacy partial state from
+/// versions that could commit rejected commands) must be prunable and
+/// grantable within a *single* acquire. Previously the validation phase
+/// pruned the dead owner into the WriteBatch but the execution phase re-read
+/// committed state, saw the stale record, and returned a bogus
+/// `Conflict(write_locked)` — while still committing partial state.
+#[test]
+fn stale_write_lock_of_dead_owner_is_grantable_in_one_command() {
+    use pathlockd::store_rocksdb::{StoreTxn, WriteTxn};
+
+    let (db, _dir) = open_temp_db();
+    let now = store_keys::now_ms();
+
+    {
+        let mut txn = WriteTxn::new(db.clone(), now);
+        // Lock record + descendant index exactly as the engine writes them,
+        // but with no owner_alive record for "ghost".
+        txn.set_str(store_keys::CF_WRITE_LOCKS, b"h:/stale", "ghost", 600_000)
+            .unwrap();
+        txn.sadd(
+            store_keys::CF_DESC_WRITE,
+            &store_keys::wrdesc_key("h:/"),
+            "h:/stale",
+            600_000,
+        )
+        .unwrap();
+        assert!(txn.commit().unwrap());
+    }
+
+    let resp = apply(&db, Command {
+        request_id: None, now_ms: now + 1,
+        op: Op::Acquire(acquire_args("bob", 30_000, 2, vec![wr("h:/stale")])),
+    });
+    assert!(
+        matches!(resp, ApplyResponse::Acquire(AcquireOutcome::Ok)),
+        "dead owner's lock must be granted in one command, got {resp:?}"
+    );
+
+    let mut txn = pathlockd::store_rocksdb::RocksDbTxn::new(db.clone(), now + 2);
+    let info = pathlockd::engine::inspect_path_inner(&mut txn, "h:/stale").unwrap();
+    assert_eq!(info.write_owner.as_deref(), Some("bob"));
+}
+
+/// A command whose outcome is `Lost` must commit nothing: previously the
+/// execution phase's writes (new lock grants, owner-set entries, lease
+/// refreshes) were committed even when a later step of the same command
+/// declared the operation lost, leaving phantom state behind.
+#[test]
+fn lost_acquire_commits_no_partial_state() {
+    use pathlockd::store_rocksdb::WriteTxn;
+
+    let (db, _dir) = open_temp_db();
+    let now = store_keys::now_ms();
+
+    // Bob holds h:/a.
+    apply(&db, Command {
+        request_id: None, now_ms: now,
+        op: Op::Acquire(acquire_args("bob", 60_000, 1, vec![wr("h:/a")])),
+    });
+
+    // Simulate external loss of the lock record (the owner set still lists it).
+    {
+        let mut txn = WriteTxn::new(db.clone(), now + 1);
+        txn.delete_raw(store_keys::CF_WRITE_LOCKS, b"h:/a").unwrap();
+        assert!(txn.commit().unwrap());
+    }
+
+    // Acquiring a new path now fails in the lease-refresh step (missing_write).
+    let resp = apply(&db, Command {
+        request_id: None, now_ms: now + 2,
+        op: Op::Acquire(acquire_args("bob", 60_000, 1, vec![wr("h:/c")])),
+    });
+    match resp {
+        ApplyResponse::Acquire(AcquireOutcome::Lost { reason, .. }) => {
+            assert_eq!(reason, "missing_write");
+        }
+        other => panic!("expected Lost, got {other:?}"),
+    }
+
+    // Nothing from the failed command may be visible: h:/c is free for others.
+    let mut txn = pathlockd::store_rocksdb::RocksDbTxn::new(db.clone(), now + 3);
+    let info = pathlockd::engine::inspect_path_inner(&mut txn, "h:/c").unwrap();
+    assert_eq!(info.write_owner, None, "lost acquire must not grant h:/c");
+    let (_, locks) = pathlockd::engine::list_owner_locks_inner(&mut txn, "bob").unwrap();
+    assert!(
+        !locks.iter().any(|l| l.path == "h:/c"),
+        "owner set must not list the lock from the lost acquire"
+    );
+
+    let resp = apply(&db, Command {
+        request_id: None, now_ms: now + 4,
+        op: Op::Acquire(acquire_args("carol", 30_000, 2, vec![wr("h:/c")])),
+    });
+    assert!(matches!(resp, ApplyResponse::Acquire(AcquireOutcome::Ok)));
+}
+
+/// The GC sweep must drain an arbitrary backlog across batched passes,
+/// persisting its cursor so already-swept regions are never rescanned, and
+/// report `scanned` so the driver knows when it has caught up.
+#[test]
+fn gc_sweep_resumes_from_cursor_and_drains_backlog() {
+    use pathlockd::store_rocksdb::{StoreTxn, WriteTxn};
+
+    let (db, _dir) = open_temp_db();
+    let now: u64 = 1_000_000;
+
+    {
+        let mut txn = WriteTxn::new(db.clone(), now);
+        for i in 0..50 {
+            txn.set_str(
+                store_keys::CF_WAIT_EDGES,
+                format!("w{i:02}").as_bytes(),
+                "blocker",
+                100,
+            )
+            .unwrap();
+        }
+        assert!(txn.commit().unwrap());
+    }
+
+    let sweep = |at: u64, batch: u32| -> (u32, u64) {
+        match apply(&db, Command {
+            request_id: None, now_ms: at,
+            op: Op::GcSweep { now_ms: at, batch },
+        }) {
+            ApplyResponse::Gc { scanned, reclaimed } => (scanned, reclaimed),
+            other => panic!("expected Gc response, got {other:?}"),
+        }
+    };
+
+    let (s1, r1) = sweep(now + 10_000, 20);
+    assert_eq!(s1, 20, "first pass scans a full batch");
+    let (s2, r2) = sweep(now + 10_001, 20);
+    assert_eq!(s2, 20, "second pass continues from the cursor");
+    let (s3, r3) = sweep(now + 10_002, 20);
+    assert_eq!(s3, 10, "third pass drains the remainder");
+    let (s4, r4) = sweep(now + 10_003, 20);
+    assert_eq!(s4, 0, "drained backlog scans nothing");
+    assert_eq!(r1 + r2 + r3 + r4, 50, "every record reclaimed exactly once");
+
+    // The cursor is persisted in the meta CF.
+    let meta = db.cf_handle(store_keys::CF_META).unwrap();
+    assert!(
+        db.get_cf(&meta, store_keys::META_GC_CURSOR_KEY).unwrap().is_some(),
+        "gc cursor must be persisted"
+    );
+}
+
+/// An owner whose hold set exceeds the one-shot enumeration limit (legacy
+/// state, or residue accumulated faster than GC drained it) must still be
+/// recoverable: renew fails with the scan-limit error (bounded work), but
+/// force_release pages through the set and fully cleans it up. Previously
+/// force_release/release_all used the same limited scan and errored, leaving
+/// the owner permanently wedged with every RPC failing.
+#[test]
+fn force_release_recovers_owner_beyond_enumeration_limit() {
+    use pathlockd::store_rocksdb::{StoreTxn, WriteTxn};
+
+    let (db, _dir) = open_temp_db();
+    let now = store_keys::now_ms();
+    let own_key = store_keys::own_prefix("hoarder");
+
+    // Seed 66_000 live members (> MAX_SET_ENUM_MEMBERS = 65_536) directly.
+    {
+        let mut txn = WriteTxn::new(db.clone(), now);
+        txn.set_str(
+            store_keys::CF_OWNER_ALIVE,
+            &store_keys::alive_key("hoarder"),
+            "1",
+            600_000,
+        )
+        .unwrap();
+        for i in 0..66_000u32 {
+            txn.sadd(
+                store_keys::CF_OWNER_HOLDS,
+                &own_key,
+                &format!("write:h:/p{i:05}"),
+                600_000,
+            )
+            .unwrap();
+        }
+        assert!(txn.commit().unwrap());
+    }
+
+    // One-shot enumeration (renew) hits the limit error.
+    let err = state_machine::apply(&db, &Command {
+        request_id: None, now_ms: now + 2,
+        op: Op::Renew { owner: "hoarder".into(), ttl_ms: 600_000 },
+    })
+    .unwrap_err();
+    assert!(
+        err.downcast_ref::<pathlockd::store_rocksdb::SetScanLimitExceeded>().is_some(),
+        "renew should fail with the scan limit error, got {err:?}"
+    );
+
+    // Paged cleanup succeeds where it previously errored.
+    let resp = apply(&db, Command {
+        request_id: None, now_ms: now + 3,
+        op: Op::ForceRelease { victim: "hoarder".into() },
+    });
+    assert!(matches!(resp, ApplyResponse::Unit));
+
+    let mut txn = pathlockd::store_rocksdb::RocksDbTxn::new(db.clone(), now + 4);
+    assert!(!pathlockd::engine::is_owner_alive_inner(&mut txn, "hoarder").unwrap());
+    let (_, locks) = pathlockd::engine::list_owner_locks_inner(&mut txn, "hoarder").unwrap();
+    assert!(locks.is_empty(), "hold set must be fully cleaned");
+    assert!(
+        !txn.has_live_member(store_keys::CF_OWNER_HOLDS, &own_key).unwrap(),
+        "no live hold-set members may remain"
+    );
+}
+
+/// Refreshing a long-TTL record (the fence, re-stamped on every heartbeat
+/// with a one-day TTL) must reuse one quantized expiry-index slot instead of
+/// accreting a fresh index row per refresh.
+#[test]
+fn fence_refreshes_reuse_one_quantized_expiry_slot() {
+    let (db, _dir) = open_temp_db();
+    let now: u64 = 1_000_000;
+
+    apply(&db, Command {
+        request_id: None, now_ms: now,
+        op: Op::Acquire(acquire_args("alice", 30_000, 1, vec![wr("h:/f")])),
+    });
+    for i in 1..=3u64 {
+        let resp = apply(&db, Command {
+            request_id: None, now_ms: now + i * 1_000,
+            op: Op::Renew { owner: "alice".into(), ttl_ms: 30_000 },
+        });
+        assert!(matches!(resp, ApplyResponse::Renew(pathlockd::engine::RenewOutcome::Ok)));
+    }
+
+    // Count expiry-index entries pointing at the fences CF.
+    let expiry = db.cf_handle(store_keys::CF_EXPIRY).unwrap();
+    let mut fence_entries = 0;
+    let mut iter = db.raw_iterator_cf(&expiry);
+    iter.seek_to_first();
+    while iter.valid() {
+        if let Some((_exp, cf, _pk)) = store_keys::decode_expiry_entry(iter.key().unwrap()) {
+            if cf == store_keys::CF_FENCES {
+                fence_entries += 1;
+            }
+        }
+        iter.next();
+    }
+    assert_eq!(
+        fence_entries, 1,
+        "1 acquire + 3 renews must share one quantized fence expiry slot"
+    );
+}

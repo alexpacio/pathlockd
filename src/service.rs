@@ -32,6 +32,12 @@ fn engine_err(e: anyhow::Error) -> Status {
         Status::resource_exhausted("lock set too large for one request")
     } else if let Some(err) = e.downcast_ref::<crate::cluster::router::MultiDomainUnsupported>() {
         Status::invalid_argument(err.to_string())
+    } else if let Some(err) = e.downcast_ref::<crate::cluster::router::WriteQueueFull>() {
+        // Honest backpressure: the writer is saturated; the client should
+        // back off and retry rather than queue behind a 30s deadline.
+        Status::unavailable(err.to_string())
+    } else if let Some(err) = e.downcast_ref::<crate::cluster::router::WriterUnavailable>() {
+        Status::unavailable(err.to_string())
     } else {
         tracing::error!(error = %e, "internal error serving request");
         Status::internal("internal error")
@@ -541,7 +547,7 @@ impl PathLock for PathLockService {
         request: Request<HealthRequest>,
     ) -> Result<Response<HealthResponse>, Status> {
         crate::otel::observe_rpc(PATH_LOCK_SERVICE, "Health", request, |_request| async move {
-            let status = crate::cluster::health::check_ready();
+            let status = crate::cluster::health::check_ready(&self.router).await;
             Ok(Response::new(HealthResponse { ok: status.ready, detail: status.detail }))
         }).await
     }

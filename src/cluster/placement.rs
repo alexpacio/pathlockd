@@ -41,7 +41,7 @@ pub fn select_voters(group_id: u64, nodes: &[u64], replication_factor: u32) -> V
         })
         .collect();
 
-    weights.sort_by(|a, b| b.1.cmp(&a.1));
+    weights.sort_by_key(|&(_, weight)| std::cmp::Reverse(weight));
     weights
         .into_iter()
         .take(replication_factor as usize)

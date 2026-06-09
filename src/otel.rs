@@ -125,13 +125,32 @@ where
     result
 }
 
-pub fn record_gc_sweep(reclaimed: u64, elapsed: Duration, success: bool) {
+pub fn record_gc_sweep(scanned: u64, reclaimed: u64, elapsed: Duration, success: bool) {
     if let Some(metrics) = METRICS.get() {
         let attrs = [KeyValue::new("success", success)];
         metrics.gc_sweeps.add(1, &attrs);
         metrics.gc_duration_ms.record(elapsed.as_secs_f64() * 1000.0, &attrs);
+        if scanned > 0 { metrics.gc_scanned.add(scanned, &attrs); }
         if reclaimed > 0 { metrics.gc_reclaimed.add(reclaimed, &attrs); }
     }
+}
+
+/// Register an observable gauge over the serialized writer's queue depth.
+/// A persistently high value means the write path is saturating; combined
+/// with `UNAVAILABLE` responses it is the backpressure signal.
+pub fn register_writer_queue_depth(depth: std::sync::Arc<std::sync::atomic::AtomicUsize>) {
+    let meter = global::meter(INSTRUMENTATION_NAME);
+    let gauge = meter
+        .u64_observable_gauge("pathlockd.writer.queue_depth")
+        .with_description("Commands queued for the serialized writer.")
+        .with_callback(move |observer| {
+            observer.observe(depth.load(std::sync::atomic::Ordering::Relaxed) as u64, &[]);
+        })
+        .build();
+    // Observable instruments stay registered with the meter provider; keep a
+    // handle so the registration is not dropped eagerly by misbehaving SDKs.
+    static GAUGE: OnceLock<opentelemetry::metrics::ObservableGauge<u64>> = OnceLock::new();
+    let _ = GAUGE.set(gauge);
 }
 
 fn build_tracer_provider(resource: Resource) -> anyhow::Result<SdkTracerProvider> {
@@ -275,6 +294,7 @@ struct Metrics {
     rpc_errors: Counter<u64>,
     rpc_duration_ms: Histogram<f64>,
     gc_sweeps: Counter<u64>,
+    gc_scanned: Counter<u64>,
     gc_reclaimed: Counter<u64>,
     gc_duration_ms: Histogram<f64>,
 }
@@ -287,6 +307,7 @@ impl Metrics {
             rpc_errors: meter.u64_counter("pathlockd.grpc.server.errors").with_description("Completed gRPC server requests with non-OK status.").build(),
             rpc_duration_ms: meter.f64_histogram("pathlockd.grpc.server.duration").with_description("gRPC server request duration.").with_unit("ms").build(),
             gc_sweeps: meter.u64_counter("pathlockd.gc.sweeps").with_description("Completed storage GC sweeps.").build(),
+            gc_scanned: meter.u64_counter("pathlockd.gc.scanned").with_description("Expiry index entries processed by storage GC.").build(),
             gc_reclaimed: meter.u64_counter("pathlockd.gc.reclaimed").with_description("Expired keys reclaimed by storage GC.").build(),
             gc_duration_ms: meter.f64_histogram("pathlockd.gc.duration").with_description("Storage GC sweep duration.").with_unit("ms").build(),
         }

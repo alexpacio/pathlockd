@@ -63,6 +63,9 @@ pub enum Op {
         batch: u32,
     },
     IncrFence,
+    /// Writes nothing; used to probe that the serialized writer is alive and
+    /// draining its queue (health checks).
+    Noop,
 }
 
 #[derive(Debug, Clone, Serialize, Deserialize)]
@@ -78,7 +81,12 @@ pub enum ApplyResponse {
     Renew(crate::engine::RenewOutcome),
     AssertFencing(crate::engine::AssertOutcome),
     IncrFence(i64),
-    /// Number of expired records reclaimed by a `GcSweep`.
-    Gc(u64),
+    /// Outcome of a `GcSweep` pass. `scanned` is the number of expiry-index
+    /// entries processed (a full batch means more backlog remains); `reclaimed`
+    /// is the number of underlying records deleted.
+    Gc {
+        scanned: u32,
+        reclaimed: u64,
+    },
     Unit,
 }

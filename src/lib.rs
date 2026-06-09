@@ -13,7 +13,6 @@ pub mod cluster;
 pub mod config;
 pub mod engine;
 pub mod events;
-pub mod macros;
 pub mod otel;
 pub mod raft;
 pub mod service;

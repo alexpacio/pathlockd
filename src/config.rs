@@ -11,16 +11,21 @@
 //! node_id          = "pathlockd-0"
 //! data_dir         = "/var/lib/pathlockd"
 //! public_addr      = "http://pathlockd-0.pathlockd:50051"
-//! raft_addr        = "http://pathlockd-0.pathlockd:50052"
 //! gossip_addr      = "0.0.0.0:7946"
-//! seed_nodes       = ["pathlockd-0.pathlockd:7946", "pathlockd-1.pathlockd:7946"]
 //! group_count      = 256
-//! replication_factor = 3
+//! replication_factor = 1   # >1 requires Raft replication (not implemented yet)
 //! group_gc_interval_secs = 1
 //! group_gc_batch   = 1024
+//! gc_compact_interval_secs = 600
 //! event_buffer     = 8192
 //! request_timeout_ms = 30000
 //! max_concurrent_requests_per_connection = 256
+//! write_queue_depth = 1024
+//! rocksdb_wal_sync = true
+//! rocksdb_max_total_wal_size_mb = 512
+//! rocksdb_max_background_jobs = 4
+//! rocksdb_block_cache_mb = 128
+//! rocksdb_write_buffer_mb = 16
 //! log_level        = "info"
 //! ```
 
@@ -79,10 +84,25 @@ pub struct Config {
     pub raft_snapshot_min_log_entries: u64,
     /// Max in-flight Raft proposals.
     pub raft_max_inflight: usize,
-    /// Sync RocksDB WAL on every write.
+    /// Max commands queued for the serialized writer before new writes are
+    /// rejected with UNAVAILABLE (fail-fast backpressure).
+    pub write_queue_depth: usize,
+    /// How often the swept region of the expiry index is physically compacted
+    /// away (seconds; 0 disables).
+    pub gc_compact_interval_secs: u64,
+    /// Sync the RocksDB WAL after each committed write group.
     pub rocksdb_wal_sync: bool,
     /// RocksDB max open files.
     pub rocksdb_max_open_files: i32,
+    /// Upper bound for the total WAL size (MiB); cold column families are
+    /// force-flushed beyond this so the WAL cannot grow unbounded.
+    pub rocksdb_max_total_wal_size_mb: u64,
+    /// RocksDB background flush/compaction jobs.
+    pub rocksdb_max_background_jobs: i32,
+    /// Shared block cache size (MiB).
+    pub rocksdb_block_cache_mb: u64,
+    /// Per-column-family memtable size (MiB).
+    pub rocksdb_write_buffer_mb: u64,
     /// tracing-subscriber log filter.
     pub log_level: String,
 }
@@ -98,7 +118,9 @@ impl Default for Config {
             gossip_addr: "0.0.0.0:7946".to_string(),
             seed_nodes: Vec::new(),
             group_count: 256,
-            replication_factor: 3,
+            // Clustered replication is not implemented yet (P3); default to the
+            // only deployment shape that is actually safe today.
+            replication_factor: 1,
             group_gc_interval_secs: 1,
             group_gc_batch: 1024,
             event_buffer: 8192,
@@ -113,8 +135,14 @@ impl Default for Config {
             raft_snapshot_interval_entries: 10_000,
             raft_snapshot_min_log_entries: 5_000,
             raft_max_inflight: 256,
+            write_queue_depth: 1024,
+            gc_compact_interval_secs: 600,
             rocksdb_wal_sync: true,
             rocksdb_max_open_files: 4096,
+            rocksdb_max_total_wal_size_mb: 512,
+            rocksdb_max_background_jobs: 4,
+            rocksdb_block_cache_mb: 128,
+            rocksdb_write_buffer_mb: 16,
             log_level: "info".to_string(),
         }
     }
@@ -146,8 +174,14 @@ struct FileConfig {
     raft_snapshot_interval_entries: Option<u64>,
     raft_snapshot_min_log_entries: Option<u64>,
     raft_max_inflight: Option<usize>,
+    write_queue_depth: Option<usize>,
+    gc_compact_interval_secs: Option<u64>,
     rocksdb_wal_sync: Option<bool>,
     rocksdb_max_open_files: Option<i32>,
+    rocksdb_max_total_wal_size_mb: Option<u64>,
+    rocksdb_max_background_jobs: Option<i32>,
+    rocksdb_block_cache_mb: Option<u64>,
+    rocksdb_write_buffer_mb: Option<u64>,
     log_level: Option<String>,
 }
 
@@ -219,7 +253,31 @@ impl Config {
                 anyhow::bail!("peer_refresh_secs must be > 0 when peer_discovery_dns is set");
             }
         }
+        if self.write_queue_depth == 0 {
+            anyhow::bail!("write_queue_depth must be > 0");
+        }
+        if self.group_gc_batch == 0 {
+            anyhow::bail!("group_gc_batch must be > 0");
+        }
+        if self.rocksdb_max_total_wal_size_mb == 0 {
+            anyhow::bail!("rocksdb_max_total_wal_size_mb must be > 0");
+        }
+        if self.rocksdb_max_background_jobs <= 0 {
+            anyhow::bail!("rocksdb_max_background_jobs must be > 0");
+        }
+        if self.rocksdb_write_buffer_mb == 0 {
+            anyhow::bail!("rocksdb_write_buffer_mb must be > 0");
+        }
         Ok(())
+    }
+
+    /// True when an option implying *replicated lock state* is set. Used to
+    /// warn loudly at startup: Raft replication is not implemented yet, and
+    /// pointing several replicas at the same clients silently breaks mutual
+    /// exclusion. (`peers`/`peer_discovery_dns` are not included — they only
+    /// feed the best-effort event fan-out, which is supported.)
+    pub fn clustering_requested(&self) -> bool {
+        self.replication_factor > 1 || !self.seed_nodes.is_empty() || self.join
     }
 }
 
@@ -258,8 +316,14 @@ fn apply_file(cfg: &mut Config, file: FileConfig) {
     apply!(raft_snapshot_interval_entries);
     apply!(raft_snapshot_min_log_entries);
     apply!(raft_max_inflight);
+    apply!(write_queue_depth);
+    apply!(gc_compact_interval_secs);
     apply!(rocksdb_wal_sync);
     apply!(rocksdb_max_open_files);
+    apply!(rocksdb_max_total_wal_size_mb);
+    apply!(rocksdb_max_background_jobs);
+    apply!(rocksdb_block_cache_mb);
+    apply!(rocksdb_write_buffer_mb);
     apply!(log_level);
 }
 
@@ -282,6 +346,16 @@ fn apply_env(cfg: &mut Config) -> anyhow::Result<()> {
     if let Some(v) = env_parse::<u64>("PATHLOCKD_PEER_REFRESH_SECS")? { cfg.peer_refresh_secs = v; }
     if let Some(v) = env_parse::<u64>("PATHLOCKD_REQUEST_TIMEOUT_MS")? { cfg.request_timeout_ms = v; }
     if let Some(v) = env_parse::<usize>("PATHLOCKD_MAX_CONCURRENT_REQUESTS_PER_CONNECTION")? { cfg.max_concurrent_requests_per_connection = v; }
+    if let Some(v) = env_parse::<bool>("PATHLOCKD_BOOTSTRAP")? { cfg.bootstrap = v; }
+    if let Some(v) = env_parse::<bool>("PATHLOCKD_JOIN")? { cfg.join = v; }
+    if let Some(v) = env_parse::<usize>("PATHLOCKD_WRITE_QUEUE_DEPTH")? { cfg.write_queue_depth = v; }
+    if let Some(v) = env_parse::<u64>("PATHLOCKD_GC_COMPACT_INTERVAL_SECS")? { cfg.gc_compact_interval_secs = v; }
+    if let Some(v) = env_parse::<bool>("PATHLOCKD_ROCKSDB_WAL_SYNC")? { cfg.rocksdb_wal_sync = v; }
+    if let Some(v) = env_parse::<i32>("PATHLOCKD_ROCKSDB_MAX_OPEN_FILES")? { cfg.rocksdb_max_open_files = v; }
+    if let Some(v) = env_parse::<u64>("PATHLOCKD_ROCKSDB_MAX_TOTAL_WAL_SIZE_MB")? { cfg.rocksdb_max_total_wal_size_mb = v; }
+    if let Some(v) = env_parse::<i32>("PATHLOCKD_ROCKSDB_MAX_BACKGROUND_JOBS")? { cfg.rocksdb_max_background_jobs = v; }
+    if let Some(v) = env_parse::<u64>("PATHLOCKD_ROCKSDB_BLOCK_CACHE_MB")? { cfg.rocksdb_block_cache_mb = v; }
+    if let Some(v) = env_parse::<u64>("PATHLOCKD_ROCKSDB_WRITE_BUFFER_MB")? { cfg.rocksdb_write_buffer_mb = v; }
     if let Some(v) = env_string("PATHLOCKD_LOG_LEVEL") { cfg.log_level = v; }
     Ok(())
 }

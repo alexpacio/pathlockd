@@ -13,10 +13,16 @@
 
 `pathlockd` is a **self-contained** daemon that coordinates concurrent access to
 a **hierarchical path namespace** (`handler:/a/b/c`) across many processes and
-machines. It exposes a small, precise set of locking primitives over **gRPC** and
-stores all durable state in an embedded **RocksDB** engine with **Multi-Raft**
-consensus, so it is horizontally scalable, resilient, and highly available —
-with no external dependencies.
+machines. It exposes a small, precise set of locking primitives over **gRPC**
+and stores all durable state in an embedded **RocksDB** engine — with no
+external dependencies.
+
+> **Replication status.** Raft-replicated, multi-node lock state is the target
+> architecture but is **not implemented yet**: today each node grants locks
+> from its own private store. Run **exactly one replica**. Running several
+> replicas behind a load balancer silently breaks mutual exclusion (two owners
+> can hold the same write lock, and fencing tokens are per-node). The daemon
+> logs a prominent warning at startup if clustering options are set.
 
 It is *opinionated*: the locking model is exactly the one a virtual-filesystem
 needs — write locks that cover a whole subtree, point reads that don't, fencing
@@ -70,15 +76,13 @@ pathlockd enforces this containment directly, with O(subtree) conflict checks
    your application (one lock = one owner id = one connection)
         │  gRPC
         ▼
-   ┌─────────────┐   ┌─────────────┐   ┌─────────────┐
-   │  pathlockd  │   │  pathlockd  │   │  pathlockd  │   N replicas (gossip)
-   └──────┬──────┘   └──────┬──────┘   └──────┬──────┘
-          └─────────────────┼─────────────────┘
-                            ▼
-                    ┌───────────────┐
-                    │  RocksDB      │   embedded, per-node
-                    │  + Multi-Raft │   Raft-replicated, HA
-                    └───────────────┘
+   ┌─────────────┐
+   │  pathlockd  │   single node (today); Multi-Raft N-replica is the roadmap
+   └──────┬──────┘
+          ▼
+   ┌───────────────┐
+   │  RocksDB      │   embedded, per-node
+   └───────────────┘
 ```
 
 - **Self-contained binary.** All durable state lives in an embedded RocksDB
@@ -87,10 +91,12 @@ pathlockd enforces this containment directly, with O(subtree) conflict checks
 - **RocksDB for persistence.** Lock metadata is stored in 14 column families
   with TTL-based expiry and background GC sweeps. WAL fsync guarantees
   durability across process crashes.
-- **Multi-Raft consensus.** State-machine commands (acquire, release, renew,
-  force-release, set-claim, set-wait-edge, incr-fence, GC sweeps) are applied
-  through a serialized write path backed by RocksDB WriteBatch. The engine
-  functions are deterministic and synchronous — identical on every replica.
+- **Serialized command application.** State-machine commands (acquire, release,
+  renew, force-release, set-claim, set-wait-edge, incr-fence, GC sweeps) are
+  applied one at a time by a dedicated writer thread backed by RocksDB
+  WriteBatch, with group-committed WAL fsync and bounded-queue backpressure.
+  The engine functions are deterministic and synchronous — exactly the shape a
+  Raft apply loop needs, which is how multi-node replication will slot in.
 - **Atomicity.** Each mutating operation runs inside a single WriteBatch
   applied atomically. A global apply lock guarantees read-modify-write
   serialization, giving single-threaded correctness within a handler domain
@@ -208,47 +214,38 @@ To run the daemon on your host for development, see
 
 ## Production deployment
 
-pathlockd runs as a fleet of self-contained nodes with embedded RocksDB and
-Multi-Raft consensus.
+**Deploy exactly one replica.** Lock state is per-node and not yet replicated;
+see the replication-status note at the top. A single instance runs on any
+container runtime:
 
-1. **A single instance runs on any container runtime:**
+```bash
+docker run -d --restart=unless-stopped -p 50051:50051 \
+  -e PATHLOCKD_LISTEN="0.0.0.0:50051" \
+  -e PATHLOCKD_DATA_DIR="/data/pathlockd" \
+  -e PATHLOCKD_BOOTSTRAP="true" \
+  -v pathlockd-data:/data/pathlockd \
+  ghcr.io/alexpacio/pathlockd:0.6.0
+```
 
-   ```bash
-   docker run -d --restart=unless-stopped -p 50051:50051 \
-     -e PATHLOCKD_LISTEN="0.0.0.0:50051" \
-     -e PATHLOCKD_DATA_DIR="/data/pathlockd" \
-     -e PATHLOCKD_BOOTSTRAP="true" \
-     -v pathlockd-data:/data/pathlockd \
-     ghcr.io/alexpacio/pathlockd:0.6.0
-   ```
+Use orchestrator-level restart (and the built-in `--health-check`, which now
+verifies the write path end-to-end) for availability. The sections below about
+peer event fan-out describe the cross-instance *event delivery* layer — it
+forwards `Subscribe` events between instances but does **not** replicate lock
+state, so it does not make a multi-replica deployment safe for locking.
 
-2. **Run it replicated (HA) on Kubernetes.** Running *multiple* pathlockd
-   replicas with working cross-instance event delivery is supported on
-   **Kubernetes only**, deployed as a **StatefulSet behind a headless Service**.
-   Ready-to-apply manifests (StatefulSet, headless + client Services, PDB) are in
-   [`deploy/kubernetes/`](deploy/kubernetes/). See
-   [Why replication needs Kubernetes](#why-replication-needs-kubernetes) for the
-   rationale.
+> **Clocks.** Lease expiry uses a `now_ms` stamped into every command and
+> clamped monotonically by the serialized writer, so a backwards clock step
+> (NTP, VM resume) can never make later commands apply with earlier
+> timestamps. Fencing tokens are a monotonic counter stored in RocksDB.
 
-   For multi-node, set `PATHLOCKD_SEED_NODES` on all nodes to bootstrap the
-   gossip layer, use `PATHLOCKD_BOOTSTRAP=true` on the first node, and
-   `PATHLOCKD_JOIN=true` on subsequent nodes.
+### Event fan-out across instances (Kubernetes)
 
-> **Clocks.** Lease expiry uses a leader-stamped `now_ms` carried in every
-> Raft command, so pathlockd replicas do **not** need their clocks mutually
-> NTP-synced for correctness. Fencing tokens are a monotonic counter stored
-> in RocksDB and incremented via Raft.
-
-### Why replication needs Kubernetes
-
-All lock state lives in the embedded RocksDB engine, so any replica can serve
-any request behind any load balancer — that part is platform-agnostic. The
-constraint is the **per-owner event stream** (`Subscribe` → `released` /
-`killed` / `revoke`): an event is raised on whichever replica handled the call,
-which is frequently a *different* replica than the one holding the subscriber (a
-deadlock `RequestRevoke` or an admin `ForceRelease` targets *another* owner). To
-deliver it, the originating replica must forward to the **specific** replica
-holding that subscription — so every replica must be individually addressable
+The per-owner event stream (`Subscribe` → `released` / `killed` / `revoke`)
+raises an event on whichever instance handled the call, which may be a
+*different* instance than the one holding the subscriber (a deadlock
+`RequestRevoke` or an admin `ForceRelease` targets *another* owner). To
+deliver it, the originating instance must forward to the **specific** instance
+holding that subscription — so every instance must be individually addressable
 *and* know its current peers.
 
 - A **single load-balanced VIP** — a plain Deployment + ClusterIP, or a Docker
@@ -286,10 +283,16 @@ A TOML file (`--config pathlockd.toml` or `PATHLOCKD_CONFIG`) overlaid by
 | `bootstrap` | `PATHLOCKD_BOOTSTRAP` | `false` | Bootstrap a new cluster |
 | `join` | `PATHLOCKD_JOIN` | `false` | Join an existing cluster |
 | `group_count` | `PATHLOCKD_GROUP_COUNT` | `256` | Number of Raft groups |
-| `replication_factor` | `PATHLOCKD_REPLICATION_FACTOR` | `3` | Voters per group (must be odd) |
+| `replication_factor` | `PATHLOCKD_REPLICATION_FACTOR` | `1` | Voters per group (must be odd; >1 requires Raft replication, not implemented yet) |
 | `group_gc_interval_secs` | `PATHLOCKD_GROUP_GC_INTERVAL_SECS` | `1` | GC sweep interval (0 disables) |
 | `group_gc_batch` | `PATHLOCKD_GROUP_GC_BATCH` | `1024` | Keys processed per GC sweep |
-| `rocksdb_wal_sync` | `PATHLOCKD_ROCKSDB_WAL_SYNC` | `true` | Fsync WAL on every write |
+| `rocksdb_wal_sync` | `PATHLOCKD_ROCKSDB_WAL_SYNC` | `true` | Fsync WAL once per committed write group, before acknowledging it |
+| `gc_compact_interval_secs` | `PATHLOCKD_GC_COMPACT_INTERVAL_SECS` | `600` | Physically compact the swept expiry-index region (0 disables) |
+| `write_queue_depth` | `PATHLOCKD_WRITE_QUEUE_DEPTH` | `1024` | Bounded writer queue; overflow is rejected with `UNAVAILABLE` |
+| `rocksdb_max_total_wal_size_mb` | `PATHLOCKD_ROCKSDB_MAX_TOTAL_WAL_SIZE_MB` | `512` | Upper bound on total WAL size |
+| `rocksdb_max_background_jobs` | `PATHLOCKD_ROCKSDB_MAX_BACKGROUND_JOBS` | `4` | RocksDB flush/compaction parallelism |
+| `rocksdb_block_cache_mb` | `PATHLOCKD_ROCKSDB_BLOCK_CACHE_MB` | `128` | Shared block cache size |
+| `rocksdb_write_buffer_mb` | `PATHLOCKD_ROCKSDB_WRITE_BUFFER_MB` | `16` | Per-column-family memtable size |
 | `peers` | `PATHLOCKD_PEERS` | `[]` | static sibling pathlockd endpoints for cross-instance event fan-out (fixed replica count) |
 | `peer_discovery_dns` | `PATHLOCKD_PEER_DISCOVERY_DNS` | none | `host:port` of a headless Service that resolves to every replica; enables elastic peer fan-out (K8s) |
 | `self_ip` | `PATHLOCKD_SELF_IP` | none | this instance's own IP, to exclude itself from discovered peers (wire from the downward API `status.podIP`) |

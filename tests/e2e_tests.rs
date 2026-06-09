@@ -536,3 +536,110 @@ async fn e2e_health_endpoint() {
 
     daemon.child.kill().ok();
 }
+
+// ---------------------------------------------------------------------------
+// Unclean shutdown: SIGKILL + restart on the same data dir must work and
+// preserve acknowledged state. (With AbsoluteConsistency WAL recovery a torn
+// final WAL record made the DB permanently unopenable — the "wipe the volume
+// to recover" failure.)
+// ---------------------------------------------------------------------------
+
+async fn connect_ready(port: u16) -> PathLockClient<Channel> {
+    let addr = format!("http://127.0.0.1:{port}");
+    for _ in 0..50 {
+        tokio::time::sleep(Duration::from_millis(200)).await;
+        if let Ok(channel) = tonic::transport::Endpoint::from_shared(addr.clone())
+            .unwrap()
+            .connect_timeout(Duration::from_secs(1))
+            .connect()
+            .await
+        {
+            let mut client = PathLockClient::new(channel);
+            if let Ok(resp) = client.health(pathlockd::proto::HealthRequest {}).await {
+                if resp.into_inner().ok {
+                    return client;
+                }
+            }
+        }
+    }
+    panic!("daemon did not become ready on port {port}");
+}
+
+fn spawn_daemon_at(dir: &std::path::Path, data_dir: &std::path::Path, port: u16) -> Child {
+    let config_path = dir.join(format!("pathlockd-{port}.toml"));
+    let config = format!(
+        r#"
+listen = "127.0.0.1:{port}"
+node_id = "e2e-crash-{port}"
+data_dir = "{}"
+group_count = 4
+replication_factor = 1
+group_gc_interval_secs = 1
+group_gc_batch = 1024
+event_buffer = 128
+request_timeout_ms = 30000
+log_level = "error"
+"#,
+        data_dir.display()
+    );
+    std::fs::write(&config_path, config).unwrap();
+    Command::new(env!("CARGO_BIN_EXE_pathlockd"))
+        .arg("--config")
+        .arg(&config_path)
+        .spawn()
+        .expect("failed to start pathlockd")
+}
+
+#[tokio::test]
+async fn e2e_sigkill_restart_preserves_acknowledged_state() {
+    let dir = tempfile::tempdir().unwrap();
+    let data_dir = dir.path().join("data");
+    std::fs::create_dir_all(&data_dir).unwrap();
+
+    let port1 = alloc_port();
+    let mut child = spawn_daemon_at(dir.path(), &data_dir, port1);
+    let mut client = connect_ready(port1).await;
+
+    let resp = client
+        .acquire(AcquireRequest {
+            owner_id: "crash-owner".into(),
+            ttl_ms: 120_000,
+            fencing_token: 1,
+            requests: vec![pathlockd::proto::LockRequest {
+                path: "h:/crash".into(),
+                mode: Mode::Write as i32,
+                state: LockState::New as i32,
+            }],
+            release_requests: vec![],
+            emit_release: false,
+        })
+        .await
+        .unwrap()
+        .into_inner();
+    assert_eq!(resp.status, AcquireStatus::Ok as i32);
+
+    // SIGKILL: no shutdown hooks, no final flush — the WAL tail may be torn.
+    child.kill().expect("kill daemon");
+    child.wait().ok();
+
+    // Restart on the same volume (fresh port; the old one may linger in
+    // TIME_WAIT). The DB must open and replay acknowledged state.
+    let port2 = alloc_port();
+    let mut child2 = spawn_daemon_at(dir.path(), &data_dir, port2);
+    let mut client2 = connect_ready(port2).await;
+
+    let info = client2
+        .inspect_path(pathlockd::proto::InspectPathRequest {
+            path: "h:/crash".into(),
+        })
+        .await
+        .unwrap()
+        .into_inner();
+    assert_eq!(
+        info.write_owner, "crash-owner",
+        "acknowledged lock must survive SIGKILL + restart"
+    );
+
+    child2.kill().ok();
+    child2.wait().ok();
+}

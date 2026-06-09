@@ -33,6 +33,13 @@ use crate::store_keys::CF_WRITE_LOCKS as WR_CF;
 const SCAN_WARN_THRESHOLD: usize = 1024;
 const CLAIM_DEFAULT_TTL_MS: u64 = 3000;
 
+/// Page size for owner-wide cleanup scans (`release_all`, `force_release`).
+const RELEASE_PAGE: usize = 4096;
+/// Absolute safety valve on members processed by one owner-wide cleanup
+/// command. Cleanup past this point is left to TTL expiry + GC; the owner's
+/// liveness marker is still removed, so the residue stops blocking anyone.
+const MAX_RELEASE_MEMBERS: usize = 1 << 20;
+
 pub const REASON_PREEMPT_CLAIMED: &str = "preempt_claimed";
 
 // ---------------------------------------------------------------------------
@@ -309,6 +316,9 @@ fn find_descendant_read_conflict<T: StoreTxn>(
 ) -> anyhow::Result<Option<(String, String, String)>> {
     let idx_pfx = rddesc_prefix(path);
     let candidates = tx.smembers_limited(RDDESC_CF, &idx_pfx, MAX_SET_ENUM_MEMBERS)?;
+    if candidates.len() > SCAN_WARN_THRESHOLD {
+        warn!(key = ?path, count = candidates.len(), "large rddesc scan");
+    }
     let mut seen = std::collections::HashSet::new();
     for candidate in candidates {
         if !seen.insert(candidate.clone()) {
@@ -485,6 +495,10 @@ pub fn acquire_inner<T: StoreTxn>(
     }
 
     // 2. EXECUTION PHASE
+    //
+    // One owner has one lease: the latest acquire/renew TTL re-leases the
+    // owner's liveness marker *and* (in phase 2b) every other lock it holds,
+    // so the whole portfolio always expires together with `alive`.
     tx.set_str(ALIVE_CF, &alive_k, "1", ttl)?;
 
     for req in &args.requests {
@@ -601,12 +615,10 @@ pub fn acquire_inner<T: StoreTxn>(
                 }
             }
         }
-        // Only drop the owner's liveness marker when this op acquired nothing.
-        // If we just acquired locks, the owner is alive regardless of what
-        // committed state shows: those memberships live in the uncommitted
-        // WriteBatch and `has_live_member` reads only committed state, so it
-        // would otherwise orphan the freshly-acquired lock's ALIVE record.
-        if args.requests.is_empty() && !tx.has_live_member(OWN_CF, &own_pfx)? {
+        // The liveness marker survives iff any held lock remains. Reads
+        // observe this command's own writes, so locks acquired above count
+        // and the members released just now don't.
+        if !tx.has_live_member(OWN_CF, &own_pfx)? {
             tx.del(ALIVE_CF, &alive_k)?;
         }
     }
@@ -662,48 +674,81 @@ pub fn release_inner<T: StoreTxn>(
 // RELEASE_ALL
 // ---------------------------------------------------------------------------
 
-pub fn release_all_inner<T: StoreTxn>(
+/// Release the lock state behind one `mode:path` member of an owner's hold
+/// set. The member's own `OWN_CF` entry is removed by the caller.
+fn release_held_member<T: StoreTxn>(tx: &mut T, owner: &str, item: &str) -> anyhow::Result<()> {
+    let Some(sep) = item.find(':') else {
+        return Ok(());
+    };
+    let mode = &item[..sep];
+    let path = &item[sep + 1..];
+    if mode == "write" {
+        let wr_k = wr_key(path);
+        if tx.get_str(WR_CF, &wr_k)?.as_deref() == Some(owner) {
+            tx.del(WR_CF, &wr_k)?;
+            remove_descendant_indexes(tx, Mode::Write, path)?;
+        }
+    } else if mode == "read" {
+        let rd_pfx = rd_prefix(path);
+        tx.srem(RD_CF, &rd_pfx, owner)?;
+        if !tx.has_live_member(RD_CF, &rd_pfx)? {
+            remove_descendant_indexes(tx, Mode::Read, path)?;
+        }
+    }
+    Ok(())
+}
+
+/// Release every lock an owner holds, paging through the hold set so an
+/// oversized owner can always be cleaned up (the one-shot enumeration used by
+/// renew/acquire would error out, which previously made `release_all` and
+/// `force_release` fail for exactly the owners that most needed them).
+///
+/// The owner's liveness and wait-edge markers are removed unconditionally at
+/// the end: even if physical cleanup is capped, a dead `alive` record means
+/// every remaining record is prunable on next touch and reclaimable by GC.
+fn release_owner_wide<T: StoreTxn>(
     tx: &mut T,
     owner: &str,
     del_wait_key: bool,
 ) -> anyhow::Result<()> {
     let own_pfx = own_prefix(owner);
-    let alive_k = alive_key(owner);
-    let held = tx.smembers_limited(OWN_CF, &own_pfx, MAX_SET_ENUM_MEMBERS)?;
-
-    for item in &held {
-        match item.find(':') {
-            None => {
-                tx.srem(OWN_CF, &own_pfx, item)?;
-            }
-            Some(sep) => {
-                let mode = &item[..sep];
-                let path = &item[sep + 1..];
-                if mode == "write" {
-                    let wr_k = wr_key(path);
-                    if tx.get_str(WR_CF, &wr_k)?.as_deref() == Some(owner) {
-                        tx.del(WR_CF, &wr_k)?;
-                        remove_descendant_indexes(tx, Mode::Write, path)?;
-                    }
-                } else if mode == "read" {
-                    let rd_pfx = rd_prefix(path);
-                    tx.srem(RD_CF, &rd_pfx, owner)?;
-                    if !tx.has_live_member(RD_CF, &rd_pfx)? {
-                        remove_descendant_indexes(tx, Mode::Read, path)?;
-                    }
+    let mut cursor: Option<Vec<u8>> = None;
+    let mut processed = 0usize;
+    loop {
+        let (members, next) = tx.smembers_page(OWN_CF, &own_pfx, cursor.take(), RELEASE_PAGE)?;
+        for item in &members {
+            release_held_member(tx, owner, item)?;
+            tx.srem(OWN_CF, &own_pfx, item)?;
+            processed += 1;
+        }
+        match next {
+            None => break,
+            Some(c) => {
+                if processed >= MAX_RELEASE_MEMBERS {
+                    warn!(
+                        owner,
+                        processed, "owner-wide release hit member cap; residue left to TTL+GC"
+                    );
+                    break;
                 }
+                cursor = Some(c);
             }
         }
     }
 
-    for item in &held {
-        tx.srem(OWN_CF, &own_pfx, item)?;
-    }
-    tx.del(ALIVE_CF, &alive_k)?;
+    tx.del(ALIVE_CF, &alive_key(owner))?;
     if del_wait_key {
         tx.del(WAIT_CF, &wait_key(owner))?;
     }
     Ok(())
+}
+
+pub fn release_all_inner<T: StoreTxn>(
+    tx: &mut T,
+    owner: &str,
+    del_wait_key: bool,
+) -> anyhow::Result<()> {
+    release_owner_wide(tx, owner, del_wait_key)
 }
 
 // ---------------------------------------------------------------------------
@@ -785,40 +830,7 @@ pub fn renew_inner<T: StoreTxn>(
 // ---------------------------------------------------------------------------
 
 pub fn force_release_inner<T: StoreTxn>(tx: &mut T, victim: &str) -> anyhow::Result<()> {
-    let own_pfx = own_prefix(victim);
-    let held = tx.smembers_limited(OWN_CF, &own_pfx, MAX_SET_ENUM_MEMBERS)?;
-
-    for item in &held {
-        match item.find(':') {
-            None => {
-                tx.srem(OWN_CF, &own_pfx, item)?;
-            }
-            Some(sep) => {
-                let mode = &item[..sep];
-                let path = &item[sep + 1..];
-                if mode == "write" {
-                    let wr_k = wr_key(path);
-                    if tx.get_str(WR_CF, &wr_k)?.as_deref() == Some(victim) {
-                        tx.del(WR_CF, &wr_k)?;
-                        remove_descendant_indexes(tx, Mode::Write, path)?;
-                    }
-                } else {
-                    let rd_pfx = rd_prefix(path);
-                    tx.srem(RD_CF, &rd_pfx, victim)?;
-                    if !tx.has_live_member(RD_CF, &rd_pfx)? {
-                        remove_descendant_indexes(tx, Mode::Read, path)?;
-                    }
-                }
-            }
-        }
-    }
-
-    for item in &held {
-        tx.srem(OWN_CF, &own_pfx, item)?;
-    }
-    tx.del(ALIVE_CF, &alive_key(victim))?;
-    tx.del(WAIT_CF, &wait_key(victim))?;
-    Ok(())
+    release_owner_wide(tx, victim, true)
 }
 
 // ---------------------------------------------------------------------------
@@ -1121,17 +1133,6 @@ pub fn list_owner_locks_inner<T: StoreTxn>(
         });
     }
     Ok((alive, locks))
-}
-
-pub fn dump_locks_inner<T: StoreTxn>(
-    _tx: &mut T,
-    _cursor: Option<Vec<u8>>,
-    _owner_page: u32,
-) -> anyhow::Result<LockDumpPage> {
-    Ok(LockDumpPage {
-        entries: Vec::new(),
-        next_cursor: None,
-    })
 }
 
 // ---------------------------------------------------------------------------

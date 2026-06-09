@@ -11,14 +11,16 @@ use tonic::transport::{Endpoint, Server};
 use tracing::{debug, error, info, warn};
 
 use pathlockd::cluster::gossip;
-use pathlockd::cluster::router::Router;
+use pathlockd::cluster::router::{Router, WriterOptions};
 use pathlockd::config::Config;
 use pathlockd::events::Broadcaster;
+use pathlockd::otel;
 use pathlockd::proto::path_lock_client::PathLockClient;
 use pathlockd::proto::path_lock_server::PathLockServer;
 use pathlockd::proto::HealthRequest;
 use pathlockd::service::PathLockService;
-use pathlockd::{otel, store_keys};
+use pathlockd::store_keys;
+use pathlockd::store_rocksdb::{open_db, DbTuning};
 
 const HEALTH_PROBE_TIMEOUT: Duration = Duration::from_secs(2);
 const HTTP2_KEEPALIVE_INTERVAL: Duration = Duration::from_secs(20);
@@ -49,6 +51,20 @@ async fn main() -> anyhow::Result<()> {
         "starting pathlockd"
     );
 
+    if cfg.clustering_requested() {
+        warn!(
+            replication_factor = cfg.replication_factor,
+            seed_nodes = ?cfg.seed_nodes,
+            join = cfg.join,
+            "clustered replication is configured but NOT implemented yet: every \
+             replica grants locks from its own private store, so running more \
+             than one replica against the same clients silently breaks mutual \
+             exclusion. Run exactly one replica until Raft replication lands. \
+             (Cross-instance event fan-out via peers/peer_discovery_dns is \
+             best-effort delivery only and does not replicate lock state.)"
+        );
+    }
+
     // Ensure data directory exists
     std::fs::create_dir_all(&cfg.data_dir)?;
 
@@ -56,27 +72,30 @@ async fn main() -> anyhow::Result<()> {
     let db_path = cfg.data_dir.join("groups").join("g000001").join("db");
     std::fs::create_dir_all(&db_path)?;
 
-    let mut db_opts = rocksdb::Options::default();
-    db_opts.create_if_missing(true);
-    db_opts.create_missing_column_families(true);
-    db_opts.set_wal_recovery_mode(rocksdb::DBRecoveryMode::AbsoluteConsistency);
-    db_opts.set_max_open_files(cfg.rocksdb_max_open_files);
-
-    let cfs = store_keys::ALL_CFS;
-    let db = Arc::new(rocksdb::DB::open_cf(&db_opts, &db_path, cfs)?);
-
-    // Durability of committed applies (fsync the WAL) is governed by config.
-    pathlockd::raft::state_machine::set_wal_sync(cfg.rocksdb_wal_sync);
+    let db = open_db(
+        &db_path,
+        &DbTuning {
+            max_open_files: cfg.rocksdb_max_open_files,
+            max_total_wal_size_mb: cfg.rocksdb_max_total_wal_size_mb,
+            max_background_jobs: cfg.rocksdb_max_background_jobs,
+            block_cache_mb: cfg.rocksdb_block_cache_mb,
+            write_buffer_mb: cfg.rocksdb_write_buffer_mb,
+        },
+    )?;
 
     // Start gossip (SWIM stub in P0-P2)
     let gossip_addr: SocketAddr = cfg.gossip_addr.parse()?;
     let _members = gossip::start_gossip(1, gossip_addr, cfg.seed_nodes.clone()).await?;
 
-    // Create the router with local DB
-    let mut router = Router::new(cfg.group_count);
-    router.set_local_db(db.clone());
-
-    let router = Arc::new(router);
+    // Router owns the serialized writer thread (bounded queue + group commit).
+    let router = Arc::new(Router::new(
+        db.clone(),
+        WriterOptions {
+            queue_depth: cfg.write_queue_depth,
+            wal_sync: cfg.rocksdb_wal_sync,
+        },
+    ));
+    otel::register_writer_queue_depth(router.write_queue_depth());
 
     // Events: cross-instance fan-out
     let broadcaster = Broadcaster::new(cfg.event_buffer, &cfg.peers)?;
@@ -88,6 +107,12 @@ async fn main() -> anyhow::Result<()> {
             cfg.group_gc_interval_secs,
             cfg.group_gc_batch,
         );
+    }
+
+    // Periodically drop the already-swept region of the expiry index from
+    // disk so its tombstones never pile up in front of future scans.
+    if cfg.gc_compact_interval_secs > 0 {
+        spawn_expiry_maintenance(db.clone(), cfg.gc_compact_interval_secs);
     }
 
     // Peer discovery (DNS-based)
@@ -131,6 +156,12 @@ async fn main() -> anyhow::Result<()> {
 
 // --- Background GC ---
 
+/// Per-pass wall-clock budget. Each sweep is one bounded command through the
+/// serialized writer; the pass keeps issuing sweeps until the backlog is
+/// drained or the budget is spent, so GC throughput adapts to the write rate
+/// instead of being capped at `batch` keys per tick.
+const GC_PASS_BUDGET: Duration = Duration::from_millis(250);
+
 fn spawn_group_gc(router: Arc<Router>, interval_secs: u64, batch: u32) {
     tokio::spawn(async move {
         let mut tick = tokio::time::interval(Duration::from_secs(interval_secs));
@@ -145,14 +176,69 @@ fn spawn_group_gc(router: Arc<Router>, interval_secs: u64, batch: u32) {
 
 async fn group_gc_pass(router: Arc<Router>, batch: u32) {
     let started = Instant::now();
-    match router.gc_sweep(batch).await {
-        Ok(reclaimed) => {
-            otel::record_gc_sweep(reclaimed, started.elapsed(), true);
+    let mut total_scanned = 0u64;
+    let mut total_reclaimed = 0u64;
+    loop {
+        match router.gc_sweep(batch).await {
+            Ok((scanned, reclaimed)) => {
+                total_scanned += u64::from(scanned);
+                total_reclaimed += reclaimed;
+                // A short page means the backlog is drained.
+                if scanned < batch || started.elapsed() >= GC_PASS_BUDGET {
+                    break;
+                }
+            }
+            Err(e) => {
+                otel::record_gc_sweep(total_scanned, total_reclaimed, started.elapsed(), false);
+                // Under write saturation the sweep is rejected by the bounded
+                // queue (client traffic takes priority); retry next tick.
+                warn!(error = %e, "group gc sweep failed; retrying next tick");
+                return;
+            }
         }
-        Err(e) => {
-            otel::record_gc_sweep(0, started.elapsed(), false);
-            error!(error = %e, "group gc sweep failed");
+    }
+    otel::record_gc_sweep(total_scanned, total_reclaimed, started.elapsed(), true);
+}
+
+// --- Expiry index physical maintenance ---
+
+fn spawn_expiry_maintenance(db: Arc<rocksdb::DB>, interval_secs: u64) {
+    tokio::spawn(async move {
+        let mut tick = tokio::time::interval(Duration::from_secs(interval_secs));
+        tick.set_missed_tick_behavior(tokio::time::MissedTickBehavior::Delay);
+        tick.tick().await;
+        loop {
+            tick.tick().await;
+            run_background_step("expiry maintenance", expiry_maintenance_pass(db.clone())).await;
         }
+    });
+}
+
+/// Physically reclaim the swept region of the expiry index. Everything below
+/// the persisted GC cursor is already logically deleted; dropping whole SST
+/// files in that range (then compacting the remainder) keeps the queue-shaped
+/// column family from accreting a tombstone wall in front of the cursor.
+async fn expiry_maintenance_pass(db: Arc<rocksdb::DB>) {
+    let result = tokio::task::spawn_blocking(move || -> anyhow::Result<()> {
+        let meta = db
+            .cf_handle(store_keys::CF_META)
+            .ok_or_else(|| anyhow::anyhow!("missing meta column family"))?;
+        let Some(cursor) = db.get_cf(&meta, store_keys::META_GC_CURSOR_KEY)? else {
+            return Ok(());
+        };
+        let expiry = db
+            .cf_handle(store_keys::CF_EXPIRY)
+            .ok_or_else(|| anyhow::anyhow!("missing expiry column family"))?;
+        db.delete_file_in_range_cf(&expiry, &[] as &[u8], cursor.as_slice())
+            .map_err(|e| anyhow::anyhow!("delete_file_in_range: {e}"))?;
+        db.compact_range_cf(&expiry, None::<&[u8]>, Some(cursor.as_slice()));
+        Ok(())
+    })
+    .await;
+    match result {
+        Ok(Ok(())) => {}
+        Ok(Err(e)) => error!(error = %e, "expiry index maintenance failed"),
+        Err(e) => error!(error = %e, "expiry index maintenance task failed"),
     }
 }
 

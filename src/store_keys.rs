@@ -3,28 +3,42 @@
 //!
 //! ## Column families
 //!
+//! Set-valued state (read locks, owner holds, descendant indexes) is stored
+//! one member per RocksDB key as `set_key \0 member`, so the per-path/per-owner
+//! "set" is the contiguous key range under `set_key \0`.
+//!
 //! ```text
 //! cf:default          catches any key not routed to a specific CF (safety net)
-//! cf:meta             raft vote, membership, last_applied, group metadata
+//! cf:meta             fence counter, gc cursor, raft metadata
 //! cf:raft_log         raft log entries
-//! cf:write_locks      path -> LockRecord
-//! cf:read_locks       path\0owner -> LockRecord
-//! cf:fences           path -> FenceRecord
-//! cf:claims           path -> ClaimRecord
-//! cf:desc_write       ancestor\0path -> ExpiringIndexRecord
-//! cf:desc_read        ancestor\0path -> ExpiringIndexRecord
-//! cf:desc_claim       ancestor\0path -> ExpiringIndexRecord
-//! cf:owner_alive      owner -> AliveRecord
-//! cf:owner_holds      owner\0mode\0path -> OwnedLockRecord
-//! cf:wait_edges       owner -> WaitEdgeRecord
-//! cf:expiry           expires_at\0kind\0primary_key -> ExpiryRecord
-//! cf:request_dedupe   request_id -> cached result
+//! cf:write_locks      path -> owner record
+//! cf:read_locks       path\0 \0owner -> member record
+//! cf:fences           path -> fencing token record
+//! cf:claims           path -> claimant record
+//! cf:desc_write       ancestor\0 \0path -> member record
+//! cf:desc_read        ancestor\0 \0path -> member record
+//! cf:desc_claim       ancestor\0 \0path -> member record
+//! cf:owner_alive      owner -> liveness record
+//! cf:owner_holds      owner\0 \0mode:path -> member record
+//! cf:wait_edges       owner -> wait edge record
+//! cf:expiry           be_u64(expires_at)\0cf_name\0primary_key -> expiry record
 //! ```
 
 use std::time::{SystemTime, UNIX_EPOCH};
 
 pub const FENCE_MIN_TTL_MS: u64 = 86_400_000;
 pub const MAX_SET_ENUM_MEMBERS: usize = 65_536;
+
+/// Expiry-index timestamps for long leases are rounded up to this quantum so
+/// that refreshing the same record (e.g. a fence renewed every heartbeat with
+/// a one-day TTL) overwrites a single index key instead of accreting a fresh
+/// index row — and its eventual tombstone — per refresh.
+pub const EXPIRY_INDEX_QUANTUM_MS: u64 = 3_600_000;
+
+// --- meta column family keys ---
+
+pub const META_FENCE_COUNTER_KEY: &[u8] = b"fence_counter";
+pub const META_GC_CURSOR_KEY: &[u8] = b"gc_cursor";
 
 // --- column family names ---
 
@@ -83,16 +97,7 @@ pub fn wr_key(path: &str) -> Vec<u8> {
     path.as_bytes().to_vec()
 }
 
-/// Encode a read-lock key: `path:NUL:owner`
-pub fn rd_key(path: &str, owner: &str) -> Vec<u8> {
-    let mut buf = Vec::with_capacity(path.len() + 1 + owner.len());
-    buf.extend_from_slice(path.as_bytes());
-    buf.push(0);
-    buf.extend_from_slice(owner.as_bytes());
-    buf
-}
-
-/// Prefix for all read-lock entries for a path.
+/// Set key under which a path's read-lock owners are stored.
 pub fn rd_prefix(path: &str) -> Vec<u8> {
     let mut buf = Vec::with_capacity(path.len() + 1);
     buf.extend_from_slice(path.as_bytes());
@@ -110,18 +115,7 @@ pub fn alive_key(owner: &str) -> Vec<u8> {
     owner.as_bytes().to_vec()
 }
 
-/// Encode an owner holds key: `owner:NUL:mode:NUL:path`
-pub fn own_key(owner: &str, mode: &str, path: &str) -> Vec<u8> {
-    let mut buf = Vec::with_capacity(owner.len() + 1 + mode.len() + 1 + path.len());
-    buf.extend_from_slice(owner.as_bytes());
-    buf.push(0);
-    buf.extend_from_slice(mode.as_bytes());
-    buf.push(0);
-    buf.extend_from_slice(path.as_bytes());
-    buf
-}
-
-/// Prefix for all held-lock entries for an owner.
+/// Set key under which an owner's held `mode:path` members are stored.
 pub fn own_prefix(owner: &str) -> Vec<u8> {
     let mut buf = Vec::with_capacity(owner.len() + 1);
     buf.extend_from_slice(owner.as_bytes());
@@ -251,6 +245,22 @@ pub fn expiry_at(now: u64, ttl_ms: u64) -> u64 {
     }
 }
 
+/// Timestamp under which a record's expiry-index entry is filed.
+///
+/// Short leases index at their exact expiry. Long leases (≥ one quantum) round
+/// up to the next quantum boundary so repeated refreshes of the same record
+/// reuse one index key. The index may therefore fire *late*, never early; the
+/// GC sweep re-checks the record's own expiry before reclaiming it, and
+/// logical expiry (`expired`) is enforced on read regardless.
+pub fn quantized_index_expiry(now_ms: u64, exp: u64) -> u64 {
+    if exp.saturating_sub(now_ms) < EXPIRY_INDEX_QUANTUM_MS {
+        exp
+    } else {
+        exp.div_ceil(EXPIRY_INDEX_QUANTUM_MS)
+            .saturating_mul(EXPIRY_INDEX_QUANTUM_MS)
+    }
+}
+
 #[cfg(test)]
 mod tests {
     use super::*;
@@ -299,23 +309,9 @@ mod tests {
     }
 
     #[test]
-    fn rd_key_encodes_path_nul_owner() {
-        let key = rd_key("h:/a", "alice");
-        let expected: Vec<u8> = b"h:/a\x00alice".to_vec();
-        assert_eq!(key, expected);
-    }
-
-    #[test]
     fn rd_prefix_is_path_plus_nul() {
         let prefix = rd_prefix("h:/a");
         assert_eq!(prefix, b"h:/a\x00");
-    }
-
-    #[test]
-    fn rd_key_starts_with_rd_prefix() {
-        let prefix = rd_prefix("h:/a");
-        let key = rd_key("h:/a", "bob");
-        assert!(key.starts_with(&prefix));
     }
 
     #[test]
@@ -339,18 +335,22 @@ mod tests {
     }
 
     #[test]
-    fn own_key_encodes_owner_nul_mode_nul_path() {
-        let key = own_key("alice", "write", "h:/a");
-        let expected: Vec<u8> = b"alice\x00write\x00h:/a".to_vec();
-        assert_eq!(key, expected);
+    fn own_prefix_is_owner_plus_nul() {
+        assert_eq!(own_prefix("alice"), b"alice\x00");
     }
 
     #[test]
-    fn own_prefix_is_owner_plus_nul() {
-        let prefix = own_prefix("alice");
-        assert_eq!(prefix, b"alice\x00");
-        let key = own_key("alice", "read", "h:/b");
-        assert!(key.starts_with(&prefix));
+    fn quantized_index_expiry_rounds_long_leases_up() {
+        let q = EXPIRY_INDEX_QUANTUM_MS;
+        // Short leases keep their exact expiry.
+        assert_eq!(quantized_index_expiry(1_000, 1_000 + q - 1), 1_000 + q - 1);
+        // Long leases round up to the next quantum boundary.
+        assert_eq!(quantized_index_expiry(1_000, q + 1_000), 2 * q);
+        assert_eq!(quantized_index_expiry(0, 3 * q), 3 * q);
+        // Never rounds down: quantized >= exp always.
+        for exp in [q, q + 1, 2 * q - 1, 2 * q] {
+            assert!(quantized_index_expiry(0, exp) >= exp);
+        }
     }
 
     #[test]

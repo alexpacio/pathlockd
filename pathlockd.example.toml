@@ -26,8 +26,9 @@ bootstrap = true
 # Number of Raft groups (deterministic sharding via HRW hashing).
 group_count = 256
 
-# Raft replication factor (must be odd).
-replication_factor = 3
+# Raft replication factor (must be odd). NOTE: >1 requires Raft replication,
+# which is not implemented yet — run exactly one replica.
+replication_factor = 1
 
 # Raft tuning.
 raft_snapshot_interval_entries = 10000
@@ -35,12 +36,25 @@ raft_snapshot_min_log_entries = 5000
 raft_max_inflight = 256
 
 # RocksDB tuning.
-rocksdb_wal_sync = true
+rocksdb_wal_sync = true                # fsync WAL once per committed write group
 rocksdb_max_open_files = 4096
+rocksdb_max_total_wal_size_mb = 512    # cap total WAL size (cold CFs get flushed)
+rocksdb_max_background_jobs = 4        # flush/compaction parallelism
+rocksdb_block_cache_mb = 128           # shared block cache
+rocksdb_write_buffer_mb = 16           # per-column-family memtable size
 
-# GC sweep of expired records (0 disables).
+# Serialized writer queue depth; submissions beyond it are rejected with
+# UNAVAILABLE (fail-fast backpressure instead of unbounded queueing).
+write_queue_depth = 1024
+
+# GC sweep of expired records (0 disables). Each tick drains the expiry
+# backlog in batches until caught up (within a small time budget).
 group_gc_interval_secs = 1
 group_gc_batch = 1024
+
+# Physically compact the already-swept region of the expiry index every N
+# seconds so old tombstones never slow future scans (0 disables).
+gc_compact_interval_secs = 600
 
 # Cross-instance event fan-out. Leave unset for a single instance; the
 # client-side recheck poll is always the correctness backstop.
