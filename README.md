@@ -334,8 +334,16 @@ export OTEL_EXPORTER_OTLP_PROTOCOL=http/protobuf
 The full contract is in [`proto/pathlockd.proto`](proto/pathlockd.proto). The
 `PathLock` service: `Acquire`, `Release`, `ReleaseAll`, `Renew`, `ForceRelease`,
 `AssertFencing`, `DetectCycle`, `IsBlocking`, `IncrFencingToken`, `SetWaitEdge`,
-`ClearWaitEdge`, `IsOwnerAlive`, `RequestRevoke`, `Subscribe` (server stream),
-`Health`.
+`ClearWaitEdge`, `SetClaim`, `ClearClaim`, `IsOwnerAlive`, `RequestRevoke`,
+`Subscribe` (server stream), `Health`.
+
+Claims (`SetClaim`/`ClearClaim`) are TTL-governed anti-starvation reservations:
+a waiter plants a claim on the path it is queued for, new overlapping acquires
+by other owners bounce with `preempt_claimed` while existing holders drain, and
+the claimant's own acquire consumes the claim atomically on grant. `SetClaim`
+is claim-if-absent — a live foreign claim is reported, never overwritten — and
+claims require no liveness lease, so a pure waiter (holding nothing yet) can
+reserve, and a crashed claimant's reservation simply expires.
 
 ## Building
 
