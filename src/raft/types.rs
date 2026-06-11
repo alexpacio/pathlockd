@@ -104,6 +104,10 @@ pub enum ForwardError {
     /// The group is not hosted on the contacted node.
     #[error("group not hosted on this node")]
     NotHosted,
+    /// The target could not be reached at all (client-side transport failure;
+    /// never produced by a server). Retryable against another node.
+    #[error("unreachable: {0}")]
+    Unreachable(String),
     /// Anything else (apply failure, storage error); not retryable elsewhere.
     #[error("{0}")]
     Other(String),

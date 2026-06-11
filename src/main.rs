@@ -90,25 +90,12 @@ async fn main() -> anyhow::Result<()> {
         PeerPool::new(),
     )?;
 
-    // Cluster bootstrap vs join:
-    // - bootstrap: initialize every group (and sys) with this sole voter;
-    //   idempotent across restarts.
-    // - join: resume any group with prior local raft state; brand-new nodes
-    //   start none — cores appear when leaders contact us (lazy
-    //   create-on-first-contact in the transport server).
-    if cfg.bootstrap {
-        let voters = std::collections::BTreeMap::from([(node_id, node_meta.clone())]);
-        for group in (0..cfg.group_count).chain([SYS_GROUP]) {
-            groups.bootstrap_group(group, voters.clone()).await?;
-        }
-        info!(
-            groups = cfg.group_count + 1,
-            "bootstrap: all groups initialized"
-        );
-    } else {
-        let resumed = resume_local_groups(&groups, &db, cfg.group_count).await?;
-        info!(resumed, "join: resumed locally-known raft groups");
-    }
+    // Resume every group with prior local raft state (restart path). Whether
+    // to *initialize* a brand-new cluster is decided after gossip is up, so
+    // an empty-disk node configured to bootstrap can detect an existing
+    // cluster and join it instead (split-brain guard).
+    let resumed = resume_local_groups(&groups, &db, cfg.group_count).await?;
+    info!(resumed, "resumed locally-known raft groups");
 
     // Internal raft transport (protocol RPCs, forwarding) on raft_addr.
     let raft_listen = raft_listen_addr(&cfg.raft_addr)?;
@@ -162,8 +149,39 @@ async fn main() -> anyhow::Result<()> {
             routing_prefix_segments: cfg.routing_prefix_segments,
             max_inflight_per_group: cfg.max_inflight_per_group,
         },
+        Some(members.watch()),
     ));
     otel::register_writer_queue_depth(router.write_queue_depth());
+
+    // Bootstrap decision (split-brain guard). Initializing groups is only
+    // allowed when this node has no prior raft state AND no existing cluster
+    // answers through the seeds — a bootstrap-configured node restarting on a
+    // wiped volume must rejoin its old cluster, never found a second one.
+    if cfg.bootstrap {
+        if resumed > 0 {
+            // Prior state: cores resumed above; (re-)initialize is a no-op.
+            info!("bootstrap flag set but local raft state exists; resuming, not re-initializing");
+        } else if !cfg.seed_nodes.is_empty()
+            && router
+                .discover_existing_cluster(Duration::from_secs(10))
+                .await
+        {
+            warn!(
+                "bootstrap requested on an empty disk, but an existing cluster \
+                 answered through the seeds — refusing to initialize a second \
+                 cluster; joining the existing one instead"
+            );
+        } else {
+            let voters = std::collections::BTreeMap::from([(node_id, node_meta.clone())]);
+            for group in (0..cfg.group_count).chain([SYS_GROUP]) {
+                groups.bootstrap_group(group, voters.clone()).await?;
+            }
+            info!(
+                groups = cfg.group_count + 1,
+                "bootstrap: all groups initialized"
+            );
+        }
+    }
 
     // Elastic membership: every node reconciles the groups it leads.
     spawn_controller(

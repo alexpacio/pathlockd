@@ -221,8 +221,9 @@ fn cf_options(name: &str, cache: &rocksdb::Cache, tuning: &DbTuning) -> rocksdb:
     table.set_pin_l0_filter_and_index_blocks_in_cache(true);
     opts.set_block_based_table_factory(&table);
 
-    if name == store_keys::CF_EXPIRY {
-        // Pure FIFO workload: everything written is later deleted in order.
+    if name == store_keys::CF_EXPIRY || name == store_keys::CF_RAFT_LOG {
+        // Queue-shaped workloads: written at the head, range-deleted from the
+        // tail (expiry sweep / raft log purge).
         opts.add_compact_on_deletion_collector_factory(10_000, 2_500, 0.25);
     } else if store_keys::STATE_CFS.contains(&name) {
         opts.add_compact_on_deletion_collector_factory(10_000, 5_000, 0.5);

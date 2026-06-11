@@ -33,6 +33,7 @@ use std::time::Duration;
 
 use tracing::debug;
 
+use crate::cluster::gossip::MemberMap;
 use crate::cluster::placement::{place_domain, routing_prefix, GroupId, SYS_GROUP};
 use crate::engine::{
     AcquireArgs, AcquireOutcome, AssertOutcome, ClaimOutcome, CycleOutcome, LockDumpPage,
@@ -88,6 +89,10 @@ pub struct Router {
     groups: Arc<RaftGroups>,
     routing: RoutingOptions,
     pool: PeerPool,
+    /// Gossip member catalog: lets a node with no leader hint (a fresh
+    /// joiner, or after a hint went stale) proxy through any known peer,
+    /// whose `NotLeader` rejection carries the real leader.
+    members: Option<tokio::sync::watch::Receiver<MemberMap>>,
     /// Last-known leader per group, learned from local metrics and
     /// `NotLeader` rejections.
     leader_hints: RwLock<HashMap<GroupId, (u64, NodeMeta)>>,
@@ -99,7 +104,11 @@ pub struct Router {
 }
 
 impl Router {
-    pub fn new(groups: Arc<RaftGroups>, routing: RoutingOptions) -> Self {
+    pub fn new(
+        groups: Arc<RaftGroups>,
+        routing: RoutingOptions,
+        members: Option<tokio::sync::watch::Receiver<MemberMap>>,
+    ) -> Self {
         let mut inflight = HashMap::new();
         for group in (0..routing.group_count).chain([SYS_GROUP]) {
             inflight.insert(
@@ -122,6 +131,7 @@ impl Router {
             groups,
             routing,
             pool,
+            members,
             leader_hints: RwLock::new(HashMap::new()),
             inflight,
             inflight_total: Arc::new(AtomicUsize::new(0)),
@@ -226,6 +236,27 @@ impl Router {
         Some((leader_id, node))
     }
 
+    /// Forwarding targets for one attempt: the best leader guess first, then
+    /// every other gossip-known peer (a non-leader replica answers `NotLeader`
+    /// with the real leader; a non-hosting node answers `NotHosted`).
+    fn forward_targets(&self, group: GroupId) -> Vec<(u64, NodeMeta)> {
+        let mut targets: Vec<(u64, NodeMeta)> = Vec::new();
+        if let Some(leader) = self.leader_of(group) {
+            if leader.0 != self.groups.node_id() {
+                targets.push(leader);
+            }
+        }
+        if let Some(members) = &self.members {
+            for (id, ident) in members.borrow().iter() {
+                if *id == self.groups.node_id() || targets.iter().any(|(t, _)| t == id) {
+                    continue;
+                }
+                targets.push((*id, ident.meta.clone()));
+            }
+        }
+        targets
+    }
+
     /// Apply a command on the group's leader: locally when possible,
     /// otherwise forwarded with bounded leader-chasing.
     async fn apply_to(&self, group: GroupId, cmd: Command) -> anyhow::Result<ApplyResponse> {
@@ -270,32 +301,38 @@ impl Router {
                 }
             }
 
-            // Forward to the best-known leader.
-            let Some((leader_id, leader_meta)) = self.leader_of(group) else {
+            // Forward: best-known leader first, then any gossip-known peer.
+            let targets = self.forward_targets(group);
+            if targets.is_empty() {
                 tokio::time::sleep(Duration::from_millis(200)).await;
                 continue;
-            };
-            if leader_id == self.groups.node_id() {
-                // Stale self-hint (we just got rejected locally): drop it.
-                self.note_leader(group, None);
-                continue;
             }
-            match self
-                .forward_command(group, &leader_id, &leader_meta, &cmd)
-                .await
-            {
-                Ok(resp) => return Ok(resp),
-                Err(ForwardError::NotLeader { leader }) => {
-                    debug!(group, from = leader_id, to = ?leader.as_ref().map(|l| l.0), "chasing leader");
-                    self.note_leader(group, leader);
+            let mut chased = false;
+            for (target_id, target_meta) in targets {
+                match self
+                    .forward_command(group, &target_id, &target_meta, &cmd)
+                    .await
+                {
+                    Ok(resp) => return Ok(resp),
+                    Err(ForwardError::NotLeader { leader }) => {
+                        debug!(group, from = target_id, to = ?leader.as_ref().map(|l| l.0), "chasing leader");
+                        self.note_leader(group, leader);
+                        chased = true;
+                        break; // retry the fresh hint on the next hop
+                    }
+                    Err(ForwardError::NotHosted) | Err(ForwardError::Unreachable(_)) => {
+                        // Stale hint or dead peer: clear it, try the next one.
+                        if self.leader_of(group).is_some_and(|(id, _)| id == target_id) {
+                            self.note_leader(group, None);
+                        }
+                    }
+                    Err(ForwardError::Other(e)) => {
+                        return Err(anyhow::anyhow!("group {group} forward: {e}"))
+                    }
                 }
-                Err(ForwardError::NotHosted) => {
-                    // Hint pointed at a node that dropped the group.
-                    self.note_leader(group, None);
-                }
-                Err(ForwardError::Other(e)) => {
-                    return Err(anyhow::anyhow!("group {group} forward: {e}"))
-                }
+            }
+            if !chased {
+                tokio::time::sleep(Duration::from_millis(200)).await;
             }
         }
         Err(WriterUnavailable.into())
@@ -378,44 +415,94 @@ impl Router {
 
     async fn read_forwarded(&self, group: GroupId, op: ReadOp) -> anyhow::Result<ReadResult> {
         for _hop in 0..MAX_FORWARD_HOPS {
-            let Some((leader_id, leader_meta)) = self.leader_of(group) else {
+            let targets = self.forward_targets(group);
+            if targets.is_empty() {
                 tokio::time::sleep(Duration::from_millis(200)).await;
                 continue;
-            };
-            if leader_id == self.groups.node_id() && self.groups.get(group).is_none() {
-                self.note_leader(group, None);
-                continue;
             }
-            let channel = self
-                .pool
-                .channel(leader_id, &leader_meta.raft_addr)
-                .map_err(|e| anyhow::anyhow!(e))?;
-            let mut client = RaftTransportClient::new(channel);
-            let read_op = bincode::serde::encode_to_vec(&op, bincode::config::standard())?;
-            let mut request = tonic::Request::new(ForwardReadRequest { group, read_op });
-            request.set_timeout(FORWARD_TIMEOUT);
-            match client.forward_read(request).await {
-                Ok(resp) => {
-                    let (result, _): (Result<ReadResult, ForwardError>, _) =
-                        bincode::serde::decode_from_slice(
-                            &resp.into_inner().result,
-                            bincode::config::standard(),
-                        )?;
-                    match result {
-                        Ok(r) => return Ok(r),
-                        Err(ForwardError::NotLeader { leader }) => {
-                            self.note_leader(group, leader);
-                        }
-                        Err(ForwardError::NotHosted) => self.note_leader(group, None),
-                        Err(ForwardError::Other(e)) => {
-                            return Err(anyhow::anyhow!("group {group} read: {e}"))
+            let mut chased = false;
+            for (target_id, target_meta) in targets {
+                match self
+                    .forward_read_to(group, &target_id, &target_meta, &op)
+                    .await
+                {
+                    Ok(r) => return Ok(r),
+                    Err(ForwardError::NotLeader { leader }) => {
+                        self.note_leader(group, leader);
+                        chased = true;
+                        break;
+                    }
+                    Err(ForwardError::NotHosted) | Err(ForwardError::Unreachable(_)) => {
+                        if self.leader_of(group).is_some_and(|(id, _)| id == target_id) {
+                            self.note_leader(group, None);
                         }
                     }
+                    Err(ForwardError::Other(e)) => {
+                        return Err(anyhow::anyhow!("group {group} read: {e}"))
+                    }
                 }
-                Err(e) => return Err(anyhow::anyhow!("group {group} read transport: {e}")),
+            }
+            if !chased {
+                tokio::time::sleep(Duration::from_millis(200)).await;
             }
         }
         Err(WriterUnavailable.into())
+    }
+
+    async fn forward_read_to(
+        &self,
+        group: GroupId,
+        target_id: &u64,
+        target: &NodeMeta,
+        op: &ReadOp,
+    ) -> Result<ReadResult, ForwardError> {
+        let channel = self
+            .pool
+            .channel(*target_id, &target.raft_addr)
+            .map_err(|e| ForwardError::Unreachable(e.to_string()))?;
+        let mut client = RaftTransportClient::new(channel);
+        let read_op = bincode::serde::encode_to_vec(op, bincode::config::standard())
+            .map_err(|e| ForwardError::Other(format!("encode: {e}")))?;
+        let mut request = tonic::Request::new(ForwardReadRequest { group, read_op });
+        request.set_timeout(FORWARD_TIMEOUT);
+        let resp = client
+            .forward_read(request)
+            .await
+            .map_err(|e| ForwardError::Unreachable(e.to_string()))?;
+        let (result, _): (Result<ReadResult, ForwardError>, _) = bincode::serde::decode_from_slice(
+            &resp.into_inner().result,
+            bincode::config::standard(),
+        )
+        .map_err(|e| ForwardError::Other(format!("decode: {e}")))?;
+        result
+    }
+
+    /// Probe gossip-known peers for an existing cluster: any peer whose sys
+    /// group answers (leader or follower) proves one exists. Used as the
+    /// bootstrap split-brain guard — a node configured to bootstrap but
+    /// holding an empty disk must join, not re-initialize, when its cluster
+    /// is already out there (volume loss, operator error).
+    pub async fn discover_existing_cluster(&self, wait: Duration) -> bool {
+        let deadline = tokio::time::Instant::now() + wait;
+        let probe = Command {
+            request_id: None,
+            now_ms: crate::store_keys::now_ms(),
+            op: Op::Noop,
+        };
+        loop {
+            for (id, meta) in self.forward_targets(SYS_GROUP) {
+                match self.forward_command(SYS_GROUP, &id, &meta, &probe).await {
+                    Ok(_) | Err(ForwardError::NotLeader { .. }) => return true,
+                    Err(ForwardError::NotHosted)
+                    | Err(ForwardError::Unreachable(_))
+                    | Err(ForwardError::Other(_)) => {}
+                }
+            }
+            if tokio::time::Instant::now() >= deadline {
+                return false;
+            }
+            tokio::time::sleep(Duration::from_millis(300)).await;
+        }
     }
 
     // -----------------------------------------------------------------------
@@ -928,7 +1015,7 @@ mod tests {
         for group in (0..routing.group_count).chain([SYS_GROUP]) {
             groups.bootstrap_group(group, voters.clone()).await.unwrap();
         }
-        (Arc::new(Router::new(groups, routing)), dir)
+        (Arc::new(Router::new(groups, routing, None)), dir)
     }
 
     fn wr_req(path: &str) -> LockReq {
